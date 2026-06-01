@@ -1620,8 +1620,11 @@ function ViewerPage() {
       <div className="viewerStage">
         <video
           ref={videoRef}
-          autoPlay playsInline controls
+          autoPlay playsInline
+          disablePictureInPicture
+          controlsList="nodownload noplaybackrate nofullscreen"
           className="viewerVideo"
+          onContextMenu={(e) => e.preventDefault()}
         />
 
         {status === 'ended' && (
@@ -1938,6 +1941,7 @@ function AdminDashboard({ onSignOut }) {
   const watchCallsRef = useRef(new Map())
   const previewsRef = useRef(new Map())
   const capsRef = useRef(new Map())
+  const previewFailuresRef = useRef(new Map())
   const recordersRef = useRef(new Map())
   const timelapseRefMap = useRef(new Map())
   const recordModesRef = useRef(new Map())
@@ -1993,6 +1997,7 @@ function AdminDashboard({ onSignOut }) {
     } catch { return }
     watchConnsRef.current.set(roomId, conn)
     conn.on('open', () => {
+      previewFailuresRef.current.delete(roomId)
       try { conn.send({ type: 'camera-capabilities-request', pin: ADMIN_PIN }) } catch { /* noop */ }
     })
     conn.on('data', (data) => {
@@ -2007,8 +2012,13 @@ function AdminDashboard({ onSignOut }) {
         watchConnsRef.current.delete(roomId)
       }
     }
+    const recordFailure = () => {
+      const n = (previewFailuresRef.current.get(roomId) || 0) + 1
+      previewFailuresRef.current.set(roomId, n)
+      cleanup()
+    }
     conn.on('close', cleanup)
-    conn.on('error', cleanup)
+    conn.on('error', recordFailure)
   }, [])
 
   const sendCameraControl = useCallback((roomId, constraints) => {
@@ -2228,17 +2238,49 @@ function AdminDashboard({ onSignOut }) {
   }, [endPttSession])
 
   const handleRefresh = useCallback((room) => {
-    const presence = connsRef.current.get(room.roomId)
-    const watch = watchConnsRef.current.get(room.roomId)
-    const conn = (presence && presence.open) ? presence : (watch && watch.open ? watch : null)
-    if (!conn) {
-      setAdminError('Broadcaster channel not available for refresh.')
+    const peer = peerRef.current
+    if (!peer || peer.destroyed) {
+      setAdminError('Admin peer not ready.')
       return
     }
+    // Try existing channels first (cheap path).
+    const presence = connsRef.current.get(room.roomId)
+    const watch = watchConnsRef.current.get(room.roomId)
+    const existing = (presence && presence.open) ? presence : (watch && watch.open ? watch : null)
+    if (existing) {
+      try { existing.send({ type: 'admin-refresh', pin: ADMIN_PIN }) } catch { /* fall through */ }
+    }
+    // Always also open a one-shot fresh channel so a stale/half-open conn
+    // can never block the refresh — same approach the CLI script uses.
+    let fresh
     try {
-      conn.send({ type: 'admin-refresh', pin: ADMIN_PIN })
-      setAdminError('')
-    } catch { setAdminError('Failed to send refresh command.') }
+      fresh = peer.connect(room.roomId, { reliable: true, metadata: { kind: 'admin-refresh' } })
+    } catch {
+      if (!existing) setAdminError('Failed to open refresh channel.')
+      return
+    }
+    let sent = false
+    const finish = () => {
+      if (!sent) return
+      try { fresh.close() } catch { /* noop */ }
+    }
+    fresh.on('open', () => {
+      try {
+        fresh.send({ type: 'admin-refresh', pin: ADMIN_PIN })
+        sent = true
+        setAdminError('')
+        setTimeout(finish, 400)
+      } catch {
+        if (!existing) setAdminError('Failed to send refresh command.')
+      }
+    })
+    fresh.on('error', () => {
+      if (!existing && !sent) setAdminError('Refresh channel error.')
+    })
+    setTimeout(() => {
+      if (!sent && !existing) setAdminError('Refresh timed out (broadcaster offline?).')
+      try { fresh.close() } catch { /* noop */ }
+    }, 5000)
   }, [])
 
   const handlePttDown = useCallback(async (room) => {
@@ -2394,8 +2436,27 @@ function AdminDashboard({ onSignOut }) {
       let changed = false
       streamsRef.current.forEach((entry, key) => {
         const hasPreview = previewsRef.current.has(key)
+        const failures = previewFailuresRef.current.get(key) || 0
         if (entry.adopted) {
           // Adopted entries are kept alive by the preview call, not presence.
+          // Drop if we've failed to reach the broadcaster a few times in a row
+          // and we don't currently have a live preview stream.
+          if (!hasPreview && failures >= 3) {
+            streamsRef.current.delete(key)
+            connsRef.current.delete(key)
+            capsRef.current.delete(key)
+            previewFailuresRef.current.delete(key)
+            try {
+              const raw = localStorage.getItem('hawk-admin-known-rooms')
+              const list = raw ? JSON.parse(raw) : []
+              if (Array.isArray(list)) {
+                const next = list.filter((r) => r !== key)
+                localStorage.setItem('hawk-admin-known-rooms', JSON.stringify(next))
+              }
+            } catch { /* noop */ }
+            changed = true
+            return
+          }
           if (!hasPreview && !watchConnsRef.current.has(key) && t - entry.lastSeen > PRESENCE_TIMEOUT_MS) {
             streamsRef.current.delete(key)
             connsRef.current.delete(key)
