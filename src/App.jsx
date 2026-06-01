@@ -6,6 +6,7 @@ import {
   Routes,
   useNavigate,
   useParams,
+  useSearchParams,
 } from 'react-router-dom'
 import Peer from 'peerjs'
 import {
@@ -36,12 +37,19 @@ import {
 } from 'lucide-react'
 import './App.css'
 
-// Well-known PeerJS ID for the admin presence registry.
+// Well-known PeerJS IDs for the admin presence registry.
+// First slot keeps the legacy id so older live broadcasters keep working.
 const ADMIN_PEER_ID = 'hawk-admin-presence-mwhawk-v1'
+const ADMIN_PEER_IDS = [
+  ADMIN_PEER_ID,
+  'hawk-admin-presence-mwhawk-v1-2',
+  'hawk-admin-presence-mwhawk-v1-3',
+  'hawk-admin-presence-mwhawk-v1-4',
+]
 const ADMIN_PIN = '2001'
 const PRESENCE_HEARTBEAT_MS = 5000
 const PRESENCE_TIMEOUT_MS = 15000
-const ADMIN_RETRY_MS = 4000
+const ADMIN_RETRY_MS = 2500
 const RESUME_STORAGE_KEY = 'hawk-resume-v1'
 
 function readResumeSession() {
@@ -163,12 +171,13 @@ function BroadcasterPage() {
   const adminAudioRef = useRef(null)
   const peerRef = useRef(null)
   const streamRef = useRef(null)
+  const previewStreamRef = useRef(null)
   const wakeLockRef = useRef(null)
   const statusRef = useRef('idle')
   const activeCallsRef = useRef(new Set())
   const viewerConnsRef = useRef(new Set())
-  const adminConnRef = useRef(null)
-  const adminHeartbeatRef = useRef(null)
+  // Map<slotId, { conn, heartbeat }>
+  const adminSlotsRef = useRef(new Map())
   const adminRetryRef = useRef(null)
   const connectAdminPresenceRef = useRef(() => {})
   const startBroadcastRef = useRef(() => {})
@@ -185,6 +194,7 @@ function BroadcasterPage() {
   const [streamTitle, setStreamTitle] = useState('')
   const [adminTalking, setAdminTalking] = useState(false)
   const [viewerTalking, setViewerTalking] = useState(false)
+  const [hasPreview, setHasPreview] = useState(false)
 
   useEffect(() => { statusRef.current = status }, [status])
 
@@ -223,6 +233,59 @@ function BroadcasterPage() {
     await refreshCameras()
   }, [refreshCameras])
 
+  const stopPreviewStream = useCallback(() => {
+    const s = previewStreamRef.current
+    if (!s) return
+    s.getTracks().forEach((t) => t.stop())
+    previewStreamRef.current = null
+    if (previewRef.current && !streamRef.current) previewRef.current.srcObject = null
+    setHasPreview(false)
+  }, [])
+
+  const acquirePreview = useCallback(async (deviceId) => {
+    // Don't disturb a live broadcast — it owns the camera while live.
+    if (statusRef.current === 'live' || statusRef.current === 'starting') return
+    try {
+      const target = deviceId || selectedCameraId
+      const existing = previewStreamRef.current
+      if (existing) {
+        const track = existing.getVideoTracks()[0]
+        const currentId = track?.getSettings?.().deviceId
+        if (track && (!target || currentId === target)) {
+          if (previewRef.current && previewRef.current.srcObject !== existing) {
+            previewRef.current.srcObject = existing
+          }
+          setHasPreview(true)
+          return
+        }
+        stopPreviewStream()
+      }
+      const next = await navigator.mediaDevices.getUserMedia({
+        video: target
+          ? { deviceId: { exact: target } }
+          : { width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: false,
+      })
+      // Race-safe: if we went live during await, drop this stream.
+      if (statusRef.current === 'live' || statusRef.current === 'starting') {
+        next.getTracks().forEach((t) => t.stop())
+        return
+      }
+      previewStreamRef.current = next
+      if (previewRef.current) previewRef.current.srcObject = next
+      setHasPreview(true)
+      const track = next.getVideoTracks()[0]
+      if (track?.getSettings) {
+        const s = track.getSettings()
+        if (s.deviceId) setSelectedCameraId(s.deviceId)
+      }
+      // Refresh labels in case this was the first permission grant.
+      await refreshCameras()
+    } catch {
+      setHasPreview(false)
+    }
+  }, [selectedCameraId, refreshCameras, stopPreviewStream])
+
   const releaseWakeLock = useCallback(async () => {
     if (!wakeLockRef.current) return
     await wakeLockRef.current.release().catch(() => {})
@@ -239,28 +302,35 @@ function BroadcasterPage() {
   }, [])
 
   const sendPresence = useCallback(() => {
-    const conn = adminConnRef.current
-    if (!conn || !conn.open) return
-    try {
-      conn.send({
-        type: 'presence',
-        roomId: presenceStateRef.current.roomId,
-        title: presenceStateRef.current.title,
-        startedAt: presenceStateRef.current.startedAt,
-        viewerCount: activeCallsRef.current.size,
-      })
-    } catch { /* noop */ }
+    adminSlotsRef.current.forEach(({ conn }) => {
+      if (!conn || !conn.open) return
+      try {
+        conn.send({
+          type: 'presence',
+          roomId: presenceStateRef.current.roomId,
+          title: presenceStateRef.current.title,
+          startedAt: presenceStateRef.current.startedAt,
+          viewerCount: activeCallsRef.current.size,
+        })
+      } catch { /* noop */ }
+    })
+  }, [])
+
+  const closeAdminSlot = useCallback((slotId) => {
+    const slot = adminSlotsRef.current.get(slotId)
+    if (!slot) return
+    if (slot.heartbeat) clearInterval(slot.heartbeat)
+    if (slot.conn) { try { slot.conn.close() } catch { /* noop */ } }
+    adminSlotsRef.current.delete(slotId)
   }, [])
 
   const closeAdminPresence = useCallback(() => {
-    if (adminHeartbeatRef.current) {
-      clearInterval(adminHeartbeatRef.current)
-      adminHeartbeatRef.current = null
-    }
-    if (adminConnRef.current) {
-      try { adminConnRef.current.close() } catch { /* noop */ }
-      adminConnRef.current = null
-    }
+    Array.from(adminSlotsRef.current.keys()).forEach((slotId) => {
+      const slot = adminSlotsRef.current.get(slotId)
+      if (slot?.heartbeat) clearInterval(slot.heartbeat)
+      if (slot?.conn) { try { slot.conn.close() } catch { /* noop */ } }
+    })
+    adminSlotsRef.current.clear()
   }, [])
 
   const connectAdminPresence = useCallback(() => {
@@ -279,46 +349,80 @@ function BroadcasterPage() {
       retryLater()
       return
     }
-    closeAdminPresence()
 
-    let conn
-    try {
-      conn = peer.connect(ADMIN_PEER_ID, { reliable: true, serialization: 'json' })
-    } catch {
-      retryLater()
-      return
-    }
-    adminConnRef.current = conn
-
-    const scheduleRetry = () => {
-      closeAdminPresence()
-      if (statusRef.current === 'live' || statusRef.current === 'starting') {
-        retryLater()
+    ADMIN_PEER_IDS.forEach((slotId) => {
+      if (adminSlotsRef.current.has(slotId)) {
+        const existing = adminSlotsRef.current.get(slotId)
+        if (existing?.conn?.open) return
+        closeAdminSlot(slotId)
       }
-    }
 
-    conn.on('open', () => {
-      sendPresence()
-      adminHeartbeatRef.current = setInterval(sendPresence, PRESENCE_HEARTBEAT_MS)
-    })
-    conn.on('data', (data) => {
-      if (!data || typeof data !== 'object') return
-      if (data.type === 'admin-refresh') {
-        const session = presenceStateRef.current
-        if (session.roomId) {
-          writeResumeSession({
-            roomId: session.roomId,
-            title: session.title,
-            cameraId: selectedCameraId,
-            savedAt: Date.now(),
-          })
+      let conn
+      try {
+        conn = peer.connect(slotId, { reliable: true, serialization: 'json' })
+      } catch {
+        return
+      }
+      const slot = { conn, heartbeat: null }
+      adminSlotsRef.current.set(slotId, slot)
+
+      const cleanup = () => {
+        if (slot.heartbeat) { clearInterval(slot.heartbeat); slot.heartbeat = null }
+        if (adminSlotsRef.current.get(slotId) === slot) {
+          adminSlotsRef.current.delete(slotId)
         }
-        setTimeout(() => window.location.reload(), 200)
+        if (statusRef.current === 'live' || statusRef.current === 'starting') {
+          if (!adminRetryRef.current) {
+            adminRetryRef.current = setTimeout(
+              () => connectAdminPresenceRef.current(),
+              ADMIN_RETRY_MS
+            )
+          }
+        }
       }
+
+      conn.on('open', () => {
+        try {
+          conn.send({
+            type: 'presence',
+            roomId: presenceStateRef.current.roomId,
+            title: presenceStateRef.current.title,
+            startedAt: presenceStateRef.current.startedAt,
+            viewerCount: activeCallsRef.current.size,
+          })
+        } catch { /* noop */ }
+        slot.heartbeat = setInterval(() => {
+          if (!conn.open) return
+          try {
+            conn.send({
+              type: 'presence',
+              roomId: presenceStateRef.current.roomId,
+              title: presenceStateRef.current.title,
+              startedAt: presenceStateRef.current.startedAt,
+              viewerCount: activeCallsRef.current.size,
+            })
+          } catch { /* noop */ }
+        }, PRESENCE_HEARTBEAT_MS)
+      })
+      conn.on('data', (data) => {
+        if (!data || typeof data !== 'object') return
+        if (data.type === 'admin-refresh') {
+          const session = presenceStateRef.current
+          if (session.roomId) {
+            writeResumeSession({
+              roomId: session.roomId,
+              title: session.title,
+              cameraId: selectedCameraId,
+              savedAt: Date.now(),
+            })
+          }
+          setTimeout(() => window.location.reload(), 200)
+        }
+      })
+      conn.on('close', cleanup)
+      conn.on('error', cleanup)
     })
-    conn.on('close', scheduleRetry)
-    conn.on('error', scheduleRetry)
-  }, [closeAdminPresence, sendPresence, selectedCameraId])
+  }, [closeAdminSlot, selectedCameraId])
 
   useEffect(() => {
     connectAdminPresenceRef.current = connectAdminPresence
@@ -332,6 +436,13 @@ function BroadcasterPage() {
     const desiredRoomId = override.roomId || generateRoomId()
     const desiredTitle = override.title !== undefined ? override.title : streamTitle.trim()
     const desiredCameraId = override.cameraId || selectedCameraId
+
+    // Release preview-only stream so live capture can claim the camera.
+    if (previewStreamRef.current) {
+      previewStreamRef.current.getTracks().forEach((t) => t.stop())
+      previewStreamRef.current = null
+      setHasPreview(false)
+    }
 
     try {
       const localStream = await acquireStream(desiredCameraId)
@@ -373,30 +484,59 @@ function BroadcasterPage() {
         })
 
         peer.on('connection', (conn) => {
+          const isAdminWatch = conn.metadata?.kind === 'admin-watch'
           viewerConnsRef.current.add(conn)
           const dropConn = () => viewerConnsRef.current.delete(conn)
           conn.on('close', dropConn)
           conn.on('error', dropConn)
+          conn.on('data', (data) => {
+            if (!data || typeof data !== 'object') return
+            if (data.type === 'admin-refresh' && data.pin === ADMIN_PIN) {
+              const session = presenceStateRef.current
+              if (session.roomId) {
+                writeResumeSession({
+                  roomId: session.roomId,
+                  title: session.title,
+                  cameraId: selectedCameraId,
+                  savedAt: Date.now(),
+                })
+              }
+              setTimeout(() => window.location.reload(), 200)
+            }
+          })
 
           conn.on('open', () => {
             const call = peer.call(conn.peer, streamRef.current || localStream)
             if (!call) return
             activeCallsRef.current.add(call)
-            setViewerCount(activeCallsRef.current.size)
-            sendPresence()
+            if (!isAdminWatch) {
+              setViewerCount(activeCallsRef.current.size)
+              sendPresence()
+            }
 
             const tune = () => tuneSenderBitrate(call)
             if (call.peerConnection) {
-              call.peerConnection.addEventListener('connectionstatechange', () => {
-                if (call.peerConnection.connectionState === 'connected') tune()
+              const pc = call.peerConnection
+              pc.addEventListener('connectionstatechange', () => {
+                if (pc.connectionState === 'connected') tune()
+                if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
+                  try { pc.restartIce?.() } catch { /* noop */ }
+                }
+              })
+              pc.addEventListener('iceconnectionstatechange', () => {
+                if (pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'failed') {
+                  try { pc.restartIce?.() } catch { /* noop */ }
+                }
               })
               setTimeout(tune, 1500)
             }
 
             const dropCall = () => {
               activeCallsRef.current.delete(call)
-              setViewerCount(activeCallsRef.current.size)
-              sendPresence()
+              if (!isAdminWatch) {
+                setViewerCount(activeCallsRef.current.size)
+                sendPresence()
+              }
             }
             call.on('close', dropCall)
             call.on('error', dropCall)
@@ -480,13 +620,13 @@ function BroadcasterPage() {
         try { conn.send({ type: 'bye', reason: 'broadcaster-stopped' }) } catch { /* noop */ }
       }
     })
-    if (adminConnRef.current?.open) {
-      try {
-        adminConnRef.current.send({
-          type: 'bye', roomId: presenceStateRef.current.roomId,
-        })
-      } catch { /* noop */ }
-    }
+    adminSlotsRef.current.forEach(({ conn }) => {
+      if (conn?.open) {
+        try {
+          conn.send({ type: 'bye', roomId: presenceStateRef.current.roomId })
+        } catch { /* noop */ }
+      }
+    })
     if (adminRetryRef.current) {
       clearTimeout(adminRetryRef.current)
       adminRetryRef.current = null
@@ -515,6 +655,8 @@ function BroadcasterPage() {
     setResolution('')
     setStatus('idle')
     setError('')
+    // Re-acquire low-cost preview after going offline.
+    setTimeout(() => { void acquirePreview() }, 300)
   }
 
   const copyShareUrl = async () => {
@@ -528,6 +670,8 @@ function BroadcasterPage() {
 
   useEffect(() => {
     const initialRefresh = window.setTimeout(() => { void refreshCameras() }, 0)
+    // Try to start the live preview right away (will silently fail if no permission yet).
+    const initialPreview = window.setTimeout(() => { void acquirePreview() }, 100)
     const resume = readResumeSession()
     if (resume && resume.roomId && !autoResumeAttemptedRef.current) {
       autoResumeAttemptedRef.current = true
@@ -551,6 +695,7 @@ function BroadcasterPage() {
 
     return () => {
       clearTimeout(initialRefresh)
+      clearTimeout(initialPreview)
       document.removeEventListener('visibilitychange', onVisibilityChange)
       navigator.mediaDevices?.removeEventListener('devicechange', onDeviceChange)
       if (adminRetryRef.current) {
@@ -563,9 +708,22 @@ function BroadcasterPage() {
         streamRef.current.getTracks().forEach((t) => t.stop())
         streamRef.current = null
       }
+      if (previewStreamRef.current) {
+        previewStreamRef.current.getTracks().forEach((t) => t.stop())
+        previewStreamRef.current = null
+      }
       releaseWakeLock()
     }
-  }, [refreshCameras, releaseWakeLock, requestWakeLock, closeAdminPresence])
+  }, [refreshCameras, releaseWakeLock, requestWakeLock, closeAdminPresence, acquirePreview])
+
+  // When camera selection changes (and we're not live), swap the preview.
+  useEffect(() => {
+    if (statusRef.current === 'live' || statusRef.current === 'starting') return
+    if (!selectedCameraId) return
+    const current = previewStreamRef.current?.getVideoTracks?.()[0]?.getSettings?.().deviceId
+    if (current === selectedCameraId) return
+    void acquirePreview(selectedCameraId)
+  }, [selectedCameraId, acquirePreview])
 
   const isLive = status === 'live'
   const isStarting = status === 'starting'
@@ -609,7 +767,7 @@ function BroadcasterPage() {
       <main className="broadcaster">
         <section className="stagePane">
           <div className="stage">
-            {streamRef.current ? null : (
+            {!streamRef.current && !hasPreview && (
               <div className="stageEmpty">
                 {isStarting ? (
                   <>
@@ -620,6 +778,12 @@ function BroadcasterPage() {
                   <>
                     <VideoOff size={42} />
                     <p>Camera preview will appear here</p>
+                    {cameras.length > 0 && (
+                      <button type="button" className="btn" onClick={() => acquirePreview()}>
+                        <Camera size={16} />
+                        <span>Enable preview</span>
+                      </button>
+                    )}
                   </>
                 )}
               </div>
@@ -627,9 +791,15 @@ function BroadcasterPage() {
             <video
               ref={previewRef}
               autoPlay playsInline muted
-              className={`stageVideo ${isLive || isStarting ? 'visible' : ''}`}
+              className={`stageVideo ${isLive || isStarting || hasPreview ? 'visible' : ''}`}
             />
             <audio ref={adminAudioRef} autoPlay playsInline />
+
+            {!isLive && !isStarting && hasPreview && (
+              <div className="previewBadge">
+                <Camera size={12} /> Preview
+              </div>
+            )}
 
             {(adminTalking || viewerTalking) && (
               <div className="talkBanner">
@@ -753,12 +923,18 @@ function BroadcasterPage() {
 
 function ViewerPage() {
   const { roomId = '' } = useParams()
+  const [searchParams] = useSearchParams()
+  const isAdminMode = useMemo(() => {
+    if (searchParams.get('admin') !== '1') return false
+    try { return sessionStorage.getItem('hawk-admin-unlocked') === '1' } catch { return false }
+  }, [searchParams])
   const containerRef = useRef(null)
   const videoRef = useRef(null)
   const reconnectTimerRef = useRef(null)
   const streamTimerRef = useRef(null)
   const attemptRef = useRef(0)
   const peerRef = useRef(null)
+  const connRef = useRef(null)
   const pttCallRef = useRef(null)
   const pttStreamRef = useRef(null)
   const [status, setStatus] = useState('connecting')
@@ -766,6 +942,7 @@ function ViewerPage() {
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [pttSpeaking, setPttSpeaking] = useState(false)
   const [pttError, setPttError] = useState('')
+  const [refreshSent, setRefreshSent] = useState(false)
 
   useEffect(() => {
     const onFs = () => setIsFullscreen(!!document.fullscreenElement)
@@ -853,6 +1030,16 @@ function ViewerPage() {
 
   const handlePttUp = useCallback(() => { setTalking(false) }, [setTalking])
 
+  const handleAdminRefresh = useCallback(() => {
+    const conn = connRef.current
+    if (!conn || !conn.open) return
+    try {
+      conn.send({ type: 'admin-refresh', pin: ADMIN_PIN })
+      setRefreshSent(true)
+      setTimeout(() => setRefreshSent(false), 2500)
+    } catch { /* noop */ }
+  }, [])
+
   useEffect(() => {
     let activeConn = null
     let activeCall = null
@@ -927,12 +1114,14 @@ function ViewerPage() {
         if (cancelled || ended) return
         const conn = peer.connect(roomId, { reliable: true })
         activeConn = conn
+        connRef.current = conn
 
         conn.on('open', () => { if (!cancelled && !ended) setStatus('waiting') })
         conn.on('data', (data) => {
           if (data && typeof data === 'object' && data.type === 'bye') markEnded()
         })
         conn.on('close', () => {
+          if (connRef.current === conn) connRef.current = null
           if (!gotStream) scheduleReconnect('Broadcaster not reachable. Retrying...')
         })
         conn.on('error', () => scheduleReconnect('Could not connect. Retrying...'))
@@ -951,12 +1140,25 @@ function ViewerPage() {
             videoRef.current.play().catch(() => {})
             setStatus('live')
           }
+          const pc = call.peerConnection
+          if (pc) {
+            pc.addEventListener('iceconnectionstatechange', () => {
+              const s = pc.iceConnectionState
+              if (s === 'disconnected') {
+                try { pc.restartIce?.() } catch { /* noop */ }
+              }
+            })
+          }
         })
         call.on('close', () => scheduleReconnect('Stream disconnected. Reconnecting...'))
         call.on('error', () => scheduleReconnect('Stream interrupted. Reconnecting...'))
       })
 
-      peer.on('disconnected', () => scheduleReconnect('Connection lost. Reconnecting...'))
+      peer.on('disconnected', () => {
+        // Try the cheap PeerJS reconnect first to preserve the live stream.
+        try { peer.reconnect() } catch { /* noop */ }
+        // If we lose the video too, scheduleReconnect will be triggered by the call/close handlers.
+      })
       peer.on('close', () => { if (!cancelled && !ended) scheduleReconnect('Peer closed. Reconnecting...') })
       peer.on('error', (peerError) => {
         if (peerError.type === 'peer-unavailable') {
@@ -1082,6 +1284,22 @@ function ViewerPage() {
                 <AlertTriangle size={14} /> {pttError}
               </div>
             )}
+            {isAdminMode && (
+              <div className="adminBar">
+                <span className="adminBarLabel">
+                  <ShieldCheck size={14} /> Admin controls
+                </span>
+                <button
+                  type="button"
+                  className="iconBtn iconBtn-light"
+                  onClick={handleAdminRefresh}
+                  title="Refresh broadcaster"
+                  aria-label="Refresh broadcaster"
+                >
+                  {refreshSent ? <Check size={16} /> : <RefreshCw size={16} />}
+                </button>
+              </div>
+            )}
             <button
               type="button"
               className={`pttButton ${pttSpeaking ? 'speaking' : ''}`}
@@ -1106,13 +1324,36 @@ function ViewerPage() {
 /* Admin                                                                      */
 /* -------------------------------------------------------------------------- */
 
+function PreviewVideo({ stream }) {
+  const ref = useRef(null)
+  useEffect(() => {
+    const el = ref.current
+    if (!el) return
+    if (el.srcObject !== stream) el.srcObject = stream || null
+    if (stream) el.play().catch(() => {})
+  }, [stream])
+  return (
+    <video
+      ref={ref}
+      autoPlay
+      muted
+      playsInline
+      className="thumbVideo"
+    />
+  )
+}
+
 function AdminDashboard({ onSignOut }) {
   const peerRef = useRef(null)
   const streamsRef = useRef(new Map())
   const connsRef = useRef(new Map())
+  const watchConnsRef = useRef(new Map())
+  const watchCallsRef = useRef(new Map())
+  const previewsRef = useRef(new Map())
   const sweeperRef = useRef(null)
   const pttRef = useRef({ peerId: null, call: null, stream: null })
   const [streams, setStreams] = useState([])
+  const [previewsTick, setPreviewsTick] = useState(0)
   const [adminStatus, setAdminStatus] = useState('connecting')
   const [adminError, setAdminError] = useState('')
   const [now, setNow] = useState(() => Date.now())
@@ -1122,6 +1363,37 @@ function AdminDashboard({ onSignOut }) {
 
   const publish = useCallback(() => {
     setStreams(Array.from(streamsRef.current.values()).sort((a, b) => b.startedAt - a.startedAt))
+  }, [])
+
+  const dropPreview = useCallback((roomId) => {
+    const call = watchCallsRef.current.get(roomId)
+    if (call) { try { call.close() } catch { /* noop */ } }
+    watchCallsRef.current.delete(roomId)
+    const conn = watchConnsRef.current.get(roomId)
+    if (conn) { try { conn.close() } catch { /* noop */ } }
+    watchConnsRef.current.delete(roomId)
+    const stream = previewsRef.current.get(roomId)
+    if (stream) stream.getTracks().forEach((t) => t.stop())
+    previewsRef.current.delete(roomId)
+    setPreviewsTick((t) => t + 1)
+  }, [])
+
+  const requestPreview = useCallback((roomId) => {
+    const peer = peerRef.current
+    if (!peer || peer.destroyed) return
+    if (watchConnsRef.current.has(roomId)) return
+    let conn
+    try {
+      conn = peer.connect(roomId, { reliable: true, metadata: { kind: 'admin-watch' } })
+    } catch { return }
+    watchConnsRef.current.set(roomId, conn)
+    const cleanup = () => {
+      if (watchConnsRef.current.get(roomId) === conn) {
+        watchConnsRef.current.delete(roomId)
+      }
+    }
+    conn.on('close', cleanup)
+    conn.on('error', cleanup)
   }, [])
 
   const endPttSession = useCallback(() => {
@@ -1193,59 +1465,106 @@ function AdminDashboard({ onSignOut }) {
   const handlePttUp = useCallback(() => setTalking(false), [setTalking])
 
   useEffect(() => {
-    const peer = new Peer(ADMIN_PEER_ID, { debug: 0 })
-    peerRef.current = peer
-    peer.on('open', () => setAdminStatus('listening'))
-    peer.on('connection', (conn) => {
-      let assignedRoom = ''
-      conn.on('data', (data) => {
-        if (!data || typeof data !== 'object') return
-        if (data.type === 'presence' && data.roomId) {
-          assignedRoom = data.roomId
-          connsRef.current.set(data.roomId, conn)
-          streamsRef.current.set(data.roomId, {
-            roomId: data.roomId,
-            title: data.title || '',
-            startedAt: data.startedAt || Date.now(),
-            viewerCount: typeof data.viewerCount === 'number' ? data.viewerCount : 0,
-            lastSeen: Date.now(),
-            peerId: conn.peer,
-          })
-          publish()
-        } else if (data.type === 'bye' && data.roomId) {
-          streamsRef.current.delete(data.roomId)
-          connsRef.current.delete(data.roomId)
-          publish()
+    let disposed = false
+    let activePeer = null
+
+    const attachHandlers = (peer) => {
+      peer.on('call', (call) => {
+        call.answer()
+        call.on('stream', (remote) => {
+          previewsRef.current.set(call.peer, remote)
+          watchCallsRef.current.set(call.peer, call)
+          setPreviewsTick((t) => t + 1)
+        })
+        const stop = () => {
+          if (watchCallsRef.current.get(call.peer) === call) {
+            watchCallsRef.current.delete(call.peer)
+            previewsRef.current.delete(call.peer)
+            setPreviewsTick((t) => t + 1)
+          }
         }
+        call.on('close', stop)
+        call.on('error', stop)
       })
-      conn.on('close', () => {
-        let changed = false
-        streamsRef.current.forEach((entry, key) => {
-          if (entry.peerId === conn.peer) {
-            streamsRef.current.delete(key)
-            connsRef.current.delete(key)
-            changed = true
+      peer.on('connection', (conn) => {
+        let assignedRoom = ''
+        conn.on('data', (data) => {
+          if (!data || typeof data !== 'object') return
+          if (data.type === 'presence' && data.roomId) {
+            assignedRoom = data.roomId
+            const isNew = !streamsRef.current.has(data.roomId)
+            connsRef.current.set(data.roomId, conn)
+            streamsRef.current.set(data.roomId, {
+              roomId: data.roomId,
+              title: data.title || '',
+              startedAt: data.startedAt || Date.now(),
+              viewerCount: typeof data.viewerCount === 'number' ? data.viewerCount : 0,
+              lastSeen: Date.now(),
+              peerId: conn.peer,
+            })
+            publish()
+            if (isNew) requestPreview(data.roomId)
+          } else if (data.type === 'bye' && data.roomId) {
+            streamsRef.current.delete(data.roomId)
+            connsRef.current.delete(data.roomId)
+            dropPreview(data.roomId)
+            publish()
           }
         })
-        if (assignedRoom) connsRef.current.delete(assignedRoom)
-        if (changed) publish()
+        conn.on('close', () => {
+          let changed = false
+          streamsRef.current.forEach((entry, key) => {
+            if (entry.peerId === conn.peer) {
+              streamsRef.current.delete(key)
+              connsRef.current.delete(key)
+              dropPreview(key)
+              changed = true
+            }
+          })
+          if (assignedRoom) connsRef.current.delete(assignedRoom)
+          if (changed) publish()
+        })
       })
-    })
-    peer.on('error', (err) => {
-      if (err?.type === 'unavailable-id') {
-        setAdminStatus('conflict')
-        setAdminError('Another admin dashboard is already running. Close it and reload.')
+      peer.on('disconnected', () => { try { peer.reconnect() } catch { /* noop */ } })
+    }
+
+    const tryClaim = (index) => {
+      if (disposed) return
+      if (index >= ADMIN_PEER_IDS.length) {
+        setAdminStatus('error')
+        setAdminError('All admin slots are in use. Please close another admin tab.')
         return
       }
-      if (err?.type === 'network' || err?.type === 'server-error') {
-        setAdminStatus('reconnecting')
-        setAdminError('Signaling connection issue. Retrying...')
-        return
-      }
-      setAdminStatus('error')
-      setAdminError(err?.message || 'Admin connection failed.')
-    })
-    peer.on('disconnected', () => { try { peer.reconnect() } catch { /* noop */ } })
+      const slotId = ADMIN_PEER_IDS[index]
+      const peer = new Peer(slotId, { debug: 0 })
+      activePeer = peer
+      peerRef.current = peer
+      let opened = false
+
+      peer.on('open', () => {
+        opened = true
+        setAdminStatus('listening')
+        setAdminError('')
+      })
+      peer.on('error', (err) => {
+        if (err?.type === 'unavailable-id' && !opened) {
+          try { peer.destroy() } catch { /* noop */ }
+          tryClaim(index + 1)
+          return
+        }
+        if (err?.type === 'network' || err?.type === 'server-error') {
+          setAdminStatus('reconnecting')
+          setAdminError('Signaling connection issue. Retrying...')
+          return
+        }
+        if (err?.type === 'peer-unavailable') return
+        setAdminStatus('error')
+        setAdminError(err?.message || 'Admin connection failed.')
+      })
+      attachHandlers(peer)
+    }
+
+    tryClaim(0)
 
     sweeperRef.current = setInterval(() => {
       const t = Date.now()
@@ -1254,23 +1573,41 @@ function AdminDashboard({ onSignOut }) {
         if (t - entry.lastSeen > PRESENCE_TIMEOUT_MS) {
           streamsRef.current.delete(key)
           connsRef.current.delete(key)
+          dropPreview(key)
           changed = true
         }
       })
       if (changed) publish()
+      // Retry any missing previews for known streams.
+      streamsRef.current.forEach((_, key) => {
+        if (!previewsRef.current.has(key) && !watchConnsRef.current.has(key)) {
+          requestPreview(key)
+        }
+      })
       setNow(Date.now())
     }, 2000)
 
     const streamsMap = streamsRef.current
     const connsMap = connsRef.current
+    const watchConnsMap = watchConnsRef.current
+    const watchCallsMap = watchCallsRef.current
+    const previewsMap = previewsRef.current
     return () => {
+      disposed = true
       if (sweeperRef.current) { clearInterval(sweeperRef.current); sweeperRef.current = null }
       endPttSession()
-      if (peerRef.current) { peerRef.current.destroy(); peerRef.current = null }
+      watchCallsMap.forEach((c) => { try { c.close() } catch { /* noop */ } })
+      watchConnsMap.forEach((c) => { try { c.close() } catch { /* noop */ } })
+      previewsMap.forEach((s) => s.getTracks().forEach((t) => t.stop()))
+      if (activePeer) { try { activePeer.destroy() } catch { /* noop */ } }
+      peerRef.current = null
       streamsMap.clear()
       connsMap.clear()
+      watchConnsMap.clear()
+      watchCallsMap.clear()
+      previewsMap.clear()
     }
-  }, [publish, endPttSession])
+  }, [publish, endPttSession, requestPreview, dropPreview])
 
   return (
     <div className="app adminApp">
@@ -1280,15 +1617,13 @@ function AdminDashboard({ onSignOut }) {
           <span>HAWK Admin</span>
         </div>
         <div className="topbar-status">
-          <span className={`badge ${adminStatus === 'listening' ? 'badge-live' : adminStatus === 'conflict' || adminStatus === 'error' ? 'badge-danger' : 'badge-soft'}`}>
+          <span className={`badge ${adminStatus === 'listening' ? 'badge-live' : adminStatus === 'error' ? 'badge-danger' : 'badge-soft'}`}>
             {adminStatus === 'listening'
               ? <><span className="dot" /> {streams.length} live</>
               : adminStatus === 'connecting'
               ? <><Loader2 size={14} className="spin" /> Connecting</>
               : adminStatus === 'reconnecting'
               ? <><Loader2 size={14} className="spin" /> Reconnecting</>
-              : adminStatus === 'conflict'
-              ? <><AlertTriangle size={14} /> Conflict</>
               : <><AlertTriangle size={14} /> Error</>}
           </span>
         </div>
@@ -1318,15 +1653,21 @@ function AdminDashboard({ onSignOut }) {
 
         <div className="grid">
           {streams.map((stream) => {
-            const watchUrl = `/watch/${stream.roomId}`
+            const watchUrl = `/watch/${stream.roomId}?admin=1`
             const isPttActive = pttActiveRoom === stream.roomId
+            const previewStream = previewsRef.current.get(stream.roomId)
+            void previewsTick
             return (
               <article key={stream.roomId} className="card-stream">
                 <a href={watchUrl} target="_blank" rel="noreferrer" className="thumbLink">
                   <div className="thumb">
                     <span className="liveBadge"><span className="dot" /> LIVE</span>
                     <span className="thumbMeta"><Eye size={13} /> {stream.viewerCount}</span>
-                    <Camera className="thumbIcon" size={42} strokeWidth={1.4} />
+                    {previewStream ? (
+                      <PreviewVideo stream={previewStream} />
+                    ) : (
+                      <Camera className="thumbIcon" size={42} strokeWidth={1.4} />
+                    )}
                   </div>
                 </a>
                 <div className="card-streamBody">

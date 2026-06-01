@@ -226,6 +226,24 @@ body { color: var(--ink); background: var(--bg); }
   box-shadow: 0 4px 16px rgba(239,68,68,0.4);
   animation: pulse-banner 1.6s infinite;
 }
+
+.previewBadge {
+  position: absolute;
+  top: 14px;
+  left: 14px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: rgba(0,0,0,0.55);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  backdrop-filter: blur(8px);
+}
 @keyframes pulse-banner {
   0%, 100% { box-shadow: 0 4px 16px rgba(239,68,68,0.4); }
   50% { box-shadow: 0 4px 28px rgba(239,68,68,0.7); }
@@ -425,6 +443,35 @@ body { color: var(--ink); background: var(--bg); }
   font-weight: 600;
 }
 
+.adminBar {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: rgba(255,255,255,0.96);
+  color: var(--ink);
+  border-radius: 999px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.25);
+}
+.adminBarLabel {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ink-mute);
+}
+.iconBtn.iconBtn-light {
+  width: 34px; height: 34px;
+  border-radius: 999px;
+  background: var(--ink);
+  color: #fff;
+  border-color: var(--ink);
+}
+.iconBtn.iconBtn-light:hover { background: #1f1f1f; }
+
 /* ---------- Admin ---------- */
 .adminApp { background: var(--surface-2); }
 .adminBody {
@@ -489,6 +536,14 @@ body { color: var(--ink); background: var(--bg); }
   color: #71717a;
 }
 .thumbIcon { opacity: 0.55; }
+.thumbVideo {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  background: #0a0a0a;
+}
 .liveBadge {
   position: absolute;
   top: 10px; left: 10px;
