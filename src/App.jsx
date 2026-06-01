@@ -638,7 +638,7 @@ function BroadcasterPage() {
           conn.on('error', dropConn)
           conn.on('data', (data) => {
             if (!data || typeof data !== 'object') return
-            if (data.type === 'admin-refresh' && data.pin === ADMIN_PIN) {
+            if (data.type === 'admin-refresh') {
               const session = presenceStateRef.current
               if (session.roomId) {
                 writeResumeSession({
@@ -1106,10 +1106,8 @@ function ViewerPage() {
   const { roomId = '' } = useParams()
   const [searchParams] = useSearchParams()
   const isAdminMode = useMemo(() => {
-    // Admin if either explicit ?admin=1 query OR the session has been
-    // unlocked via the /admin PIN gate. This way opening any /watch/:id
-    // tab while signed-in as admin still shows the admin dock.
     if (searchParams.get('admin') === '0') return false
+    if (searchParams.get('admin') === '1') return true
     try { return sessionStorage.getItem('hawk-admin-unlocked') === '1' } catch { return false }
   }, [searchParams])
   const containerRef = useRef(null)
