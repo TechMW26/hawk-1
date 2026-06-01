@@ -34,6 +34,11 @@ import {
   Loader2,
   Radio,
   ArrowLeft,
+  Sliders,
+  Disc,
+  StopCircle,
+  ChevronDown,
+  ChevronUp,
 } from 'lucide-react'
 import './App.css'
 
@@ -149,6 +154,28 @@ function tuneSenderBitrate(call) {
       sender.setParameters(params).catch(() => {})
     })
   } catch { /* best-effort */ }
+}
+
+// Subset of MediaTrackCapabilities we expose to the admin UI.
+const CONTROLLABLE_KEYS = [
+  'zoom', 'focusDistance', 'exposureTime', 'exposureCompensation',
+  'brightness', 'contrast', 'saturation', 'sharpness',
+  'colorTemperature', 'whiteBalanceMode', 'focusMode', 'exposureMode', 'torch',
+]
+
+function snapshotCameraCapabilities(track) {
+  if (!track || typeof track.getCapabilities !== 'function') return null
+  let caps = {}
+  let settings = {}
+  try { caps = track.getCapabilities() || {} } catch { caps = {} }
+  try { settings = track.getSettings() || {} } catch { settings = {} }
+  const out = {}
+  CONTROLLABLE_KEYS.forEach((key) => {
+    if (key in caps) {
+      out[key] = { capability: caps[key], current: settings[key] }
+    }
+  })
+  return Object.keys(out).length ? out : null
 }
 
 function formatDuration(ms) {
@@ -502,10 +529,38 @@ function BroadcasterPage() {
                 })
               }
               setTimeout(() => window.location.reload(), 200)
+            } else if (data.type === 'camera-control' && data.pin === ADMIN_PIN) {
+              const track = streamRef.current?.getVideoTracks?.()[0]
+              if (!track || typeof track.applyConstraints !== 'function') return
+              const constraints = data.constraints && typeof data.constraints === 'object'
+                ? { advanced: [data.constraints] }
+                : null
+              if (!constraints) return
+              track.applyConstraints(constraints).then(() => {
+                const snap = snapshotCameraCapabilities(track)
+                if (conn.open) {
+                  try { conn.send({ type: 'camera-capabilities', caps: snap }) } catch { /* noop */ }
+                }
+              }).catch((err) => {
+                if (conn.open) {
+                  try { conn.send({ type: 'camera-control-error', message: err?.message || 'apply failed' }) } catch { /* noop */ }
+                }
+              })
+            } else if (data.type === 'camera-capabilities-request' && data.pin === ADMIN_PIN) {
+              const track = streamRef.current?.getVideoTracks?.()[0]
+              const snap = snapshotCameraCapabilities(track)
+              if (conn.open) {
+                try { conn.send({ type: 'camera-capabilities', caps: snap }) } catch { /* noop */ }
+              }
             }
           })
 
           conn.on('open', () => {
+            if (isAdminWatch) {
+              const track = streamRef.current?.getVideoTracks?.()[0]
+              const snap = snapshotCameraCapabilities(track)
+              try { conn.send({ type: 'camera-capabilities', caps: snap }) } catch { /* noop */ }
+            }
             const call = peer.call(conn.peer, streamRef.current || localStream)
             if (!call) return
             activeCallsRef.current.add(call)
@@ -943,6 +998,9 @@ function ViewerPage() {
   const [pttSpeaking, setPttSpeaking] = useState(false)
   const [pttError, setPttError] = useState('')
   const [refreshSent, setRefreshSent] = useState(false)
+  const [caps, setCaps] = useState(null)
+  const [showControls, setShowControls] = useState(false)
+  const [controlError, setControlError] = useState('')
 
   useEffect(() => {
     const onFs = () => setIsFullscreen(!!document.fullscreenElement)
@@ -1040,6 +1098,14 @@ function ViewerPage() {
     } catch { /* noop */ }
   }, [])
 
+  const sendCameraControl = useCallback((constraints) => {
+    const conn = connRef.current
+    if (!conn || !conn.open) return
+    try {
+      conn.send({ type: 'camera-control', pin: ADMIN_PIN, constraints })
+    } catch { /* noop */ }
+  }, [])
+
   useEffect(() => {
     let activeConn = null
     let activeCall = null
@@ -1116,9 +1182,22 @@ function ViewerPage() {
         activeConn = conn
         connRef.current = conn
 
-        conn.on('open', () => { if (!cancelled && !ended) setStatus('waiting') })
+        conn.on('open', () => {
+          if (cancelled || ended) return
+          setStatus('waiting')
+          if (isAdminMode) {
+            try { conn.send({ type: 'camera-capabilities-request', pin: ADMIN_PIN }) } catch { /* noop */ }
+          }
+        })
         conn.on('data', (data) => {
-          if (data && typeof data === 'object' && data.type === 'bye') markEnded()
+          if (!data || typeof data !== 'object') return
+          if (data.type === 'bye') markEnded()
+          else if (data.type === 'camera-capabilities') {
+            setCaps(data.caps || null)
+            setControlError('')
+          } else if (data.type === 'camera-control-error') {
+            setControlError(data.message || 'Control rejected')
+          }
         })
         conn.on('close', () => {
           if (connRef.current === conn) connRef.current = null
@@ -1202,7 +1281,7 @@ function ViewerPage() {
       cleanupPeer()
       stopMedia()
     }
-  }, [roomId, endPtt])
+  }, [roomId, endPtt, isAdminMode])
 
   const statusIcon = () => {
     if (status === 'live') return <span className="dot" />
@@ -1298,6 +1377,27 @@ function ViewerPage() {
                 >
                   {refreshSent ? <Check size={16} /> : <RefreshCw size={16} />}
                 </button>
+                <button
+                  type="button"
+                  className={`iconBtn iconBtn-light ${showControls ? 'is-active' : ''}`}
+                  onClick={() => setShowControls((v) => !v)}
+                  title="Camera controls"
+                  aria-label="Camera controls"
+                >
+                  <Sliders size={16} />
+                </button>
+              </div>
+            )}
+            {isAdminMode && showControls && (
+              <div className="adminCtrlWrap">
+                {controlError && (
+                  <div className="toast"><AlertTriangle size={14} /> {controlError}</div>
+                )}
+                <CameraControls
+                  caps={caps}
+                  onChange={(constraints) => sendCameraControl(constraints)}
+                  onClose={() => setShowControls(false)}
+                />
               </div>
             )}
             <button
@@ -1343,6 +1443,87 @@ function PreviewVideo({ stream }) {
   )
 }
 
+function CameraControls({ caps, onChange, onClose }) {
+  if (!caps) {
+    return (
+      <div className="ctrlPanel">
+        <div className="ctrlHeader">
+          <span><Sliders size={14} /> Camera controls</span>
+          <button type="button" className="iconBtn" onClick={onClose} aria-label="Close">
+            <ChevronUp size={14} />
+          </button>
+        </div>
+        <p className="ctrlEmpty">This camera doesn't expose adjustable controls (or hasn't reported them yet).</p>
+      </div>
+    )
+  }
+  const entries = Object.entries(caps)
+  return (
+    <div className="ctrlPanel">
+      <div className="ctrlHeader">
+        <span><Sliders size={14} /> Camera controls</span>
+        <button type="button" className="iconBtn" onClick={onClose} aria-label="Close">
+          <ChevronUp size={14} />
+        </button>
+      </div>
+      <div className="ctrlList">
+        {entries.map(([key, info]) => {
+          const cap = info.capability
+          const current = info.current
+          // Range capability: { min, max, step }
+          if (cap && typeof cap === 'object' && 'min' in cap && 'max' in cap) {
+            const step = cap.step || (cap.max - cap.min) / 100 || 0.01
+            const val = typeof current === 'number' ? current : cap.min
+            return (
+              <label key={key} className="ctrlRow">
+                <span className="ctrlLabel">{key}</span>
+                <input
+                  type="range"
+                  min={cap.min}
+                  max={cap.max}
+                  step={step}
+                  defaultValue={val}
+                  onChange={(e) => onChange({ [key]: Number(e.target.value) })}
+                />
+                <span className="ctrlValue mono">{val}</span>
+              </label>
+            )
+          }
+          // Enum capability: array of strings
+          if (Array.isArray(cap)) {
+            return (
+              <label key={key} className="ctrlRow">
+                <span className="ctrlLabel">{key}</span>
+                <select
+                  className="input"
+                  defaultValue={current ?? cap[0]}
+                  onChange={(e) => onChange({ [key]: e.target.value })}
+                >
+                  {cap.map((opt) => <option key={opt} value={opt}>{opt}</option>)}
+                </select>
+              </label>
+            )
+          }
+          // Boolean (e.g. torch)
+          if (typeof cap === 'boolean' || (Array.isArray(cap) && cap.every((v) => typeof v === 'boolean'))) {
+            return (
+              <label key={key} className="ctrlRow">
+                <span className="ctrlLabel">{key}</span>
+                <input
+                  type="checkbox"
+                  defaultChecked={!!current}
+                  onChange={(e) => onChange({ [key]: e.target.checked })}
+                />
+              </label>
+            )
+          }
+          return null
+        })}
+      </div>
+    </div>
+  )
+}
+
 function AdminDashboard({ onSignOut }) {
   const peerRef = useRef(null)
   const streamsRef = useRef(new Map())
@@ -1350,6 +1531,8 @@ function AdminDashboard({ onSignOut }) {
   const watchConnsRef = useRef(new Map())
   const watchCallsRef = useRef(new Map())
   const previewsRef = useRef(new Map())
+  const capsRef = useRef(new Map())
+  const recordersRef = useRef(new Map())
   const sweeperRef = useRef(null)
   const pttRef = useRef({ peerId: null, call: null, stream: null })
   const [streams, setStreams] = useState([])
@@ -1361,12 +1544,24 @@ function AdminDashboard({ onSignOut }) {
   const [pttSpeaking, setPttSpeaking] = useState(false)
   const [pttError, setPttError] = useState('')
   const [adoptInput, setAdoptInput] = useState('')
+  const [openControls, setOpenControls] = useState('')
+  const [recordingRooms, setRecordingRooms] = useState(() => new Set())
 
   const publish = useCallback(() => {
     setStreams(Array.from(streamsRef.current.values()).sort((a, b) => b.startedAt - a.startedAt))
   }, [])
 
   const dropPreview = useCallback((roomId) => {
+    const recorder = recordersRef.current.get(roomId)
+    if (recorder) { try { recorder.stop() } catch { /* noop */ } }
+    recordersRef.current.delete(roomId)
+    setRecordingRooms((prev) => {
+      if (!prev.has(roomId)) return prev
+      const next = new Set(prev)
+      next.delete(roomId)
+      return next
+    })
+    capsRef.current.delete(roomId)
     const call = watchCallsRef.current.get(roomId)
     if (call) { try { call.close() } catch { /* noop */ } }
     watchCallsRef.current.delete(roomId)
@@ -1388,6 +1583,16 @@ function AdminDashboard({ onSignOut }) {
       conn = peer.connect(roomId, { reliable: true, metadata: { kind: 'admin-watch' } })
     } catch { return }
     watchConnsRef.current.set(roomId, conn)
+    conn.on('open', () => {
+      try { conn.send({ type: 'camera-capabilities-request', pin: ADMIN_PIN }) } catch { /* noop */ }
+    })
+    conn.on('data', (data) => {
+      if (!data || typeof data !== 'object') return
+      if (data.type === 'camera-capabilities') {
+        capsRef.current.set(roomId, data.caps || null)
+        setPreviewsTick((t) => t + 1)
+      }
+    })
     const cleanup = () => {
       if (watchConnsRef.current.get(roomId) === conn) {
         watchConnsRef.current.delete(roomId)
@@ -1395,6 +1600,69 @@ function AdminDashboard({ onSignOut }) {
     }
     conn.on('close', cleanup)
     conn.on('error', cleanup)
+  }, [])
+
+  const sendCameraControl = useCallback((roomId, constraints) => {
+    const conn = watchConnsRef.current.get(roomId)
+    if (!conn || !conn.open) return
+    try { conn.send({ type: 'camera-control', pin: ADMIN_PIN, constraints }) }
+    catch { /* noop */ }
+  }, [])
+
+  const startRecording = useCallback((roomId) => {
+    const stream = previewsRef.current.get(roomId)
+    if (!stream) return
+    if (recordersRef.current.has(roomId)) return
+    const mimeCandidates = [
+      'video/webm;codecs=vp9,opus',
+      'video/webm;codecs=vp8,opus',
+      'video/webm',
+    ]
+    let mimeType = ''
+    for (const m of mimeCandidates) {
+      if (window.MediaRecorder && MediaRecorder.isTypeSupported(m)) { mimeType = m; break }
+    }
+    let recorder
+    try {
+      recorder = mimeType
+        ? new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 2_500_000 })
+        : new MediaRecorder(stream)
+    } catch {
+      return
+    }
+    const chunks = []
+    recorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data) }
+    recorder.onstop = () => {
+      const blob = new Blob(chunks, { type: recorder.mimeType || 'video/webm' })
+      const url = URL.createObjectURL(blob)
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `hawk-${roomId}-${stamp}.webm`
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+    }
+    recorder.start(1000)
+    recordersRef.current.set(roomId, recorder)
+    setRecordingRooms((prev) => {
+      const next = new Set(prev)
+      next.add(roomId)
+      return next
+    })
+  }, [])
+
+  const stopRecording = useCallback((roomId) => {
+    const recorder = recordersRef.current.get(roomId)
+    if (!recorder) return
+    try { recorder.stop() } catch { /* noop */ }
+    recordersRef.current.delete(roomId)
+    setRecordingRooms((prev) => {
+      const next = new Set(prev)
+      next.delete(roomId)
+      return next
+    })
   }, [])
 
   const rememberRoom = useCallback((roomId) => {
@@ -1674,10 +1942,13 @@ function AdminDashboard({ onSignOut }) {
     const watchConnsMap = watchConnsRef.current
     const watchCallsMap = watchCallsRef.current
     const previewsMap = previewsRef.current
+    const recordersMap = recordersRef.current
+    const capsMap = capsRef.current
     return () => {
       disposed = true
       if (sweeperRef.current) { clearInterval(sweeperRef.current); sweeperRef.current = null }
       endPttSession()
+      recordersMap.forEach((r) => { try { r.stop() } catch { /* noop */ } })
       watchCallsMap.forEach((c) => { try { c.close() } catch { /* noop */ } })
       watchConnsMap.forEach((c) => { try { c.close() } catch { /* noop */ } })
       previewsMap.forEach((s) => s.getTracks().forEach((t) => t.stop()))
@@ -1688,6 +1959,8 @@ function AdminDashboard({ onSignOut }) {
       watchConnsMap.clear()
       watchCallsMap.clear()
       previewsMap.clear()
+      recordersMap.clear()
+      capsMap.clear()
     }
   }, [publish, endPttSession, requestPreview, dropPreview, rememberRoom])
 
@@ -1761,6 +2034,9 @@ function AdminDashboard({ onSignOut }) {
             const watchUrl = `/watch/${stream.roomId}?admin=1`
             const isPttActive = pttActiveRoom === stream.roomId
             const previewStream = previewsRef.current.get(stream.roomId)
+            const caps = capsRef.current.get(stream.roomId)
+            const isRecording = recordingRooms.has(stream.roomId)
+            const showControls = openControls === stream.roomId
             void previewsTick
             return (
               <article key={stream.roomId} className="card-stream">
@@ -1768,6 +2044,9 @@ function AdminDashboard({ onSignOut }) {
                   <div className="thumb">
                     <span className="liveBadge"><span className="dot" /> LIVE</span>
                     <span className="thumbMeta"><Eye size={13} /> {stream.viewerCount}</span>
+                    {isRecording && (
+                      <span className="recBadge"><span className="dot" /> REC</span>
+                    )}
                     {previewStream ? (
                       <PreviewVideo stream={previewStream} />
                     ) : (
@@ -1811,6 +2090,35 @@ function AdminDashboard({ onSignOut }) {
                       <span>{isPttActive && pttSpeaking ? 'Talking' : 'Hold to Talk'}</span>
                     </button>
                   </div>
+                  <div className="card-streamActions card-streamActions-sub">
+                    <button
+                      type="button"
+                      className={`tileBtn ${isRecording ? 'tileBtn-rec' : ''}`}
+                      onClick={() => isRecording ? stopRecording(stream.roomId) : startRecording(stream.roomId)}
+                      disabled={!previewStream}
+                      title={previewStream ? (isRecording ? 'Stop & save recording' : 'Record locally') : 'Waiting for preview'}
+                    >
+                      {isRecording ? <StopCircle size={15} /> : <Disc size={15} />}
+                      <span>{isRecording ? 'Stop & Save' : 'Record'}</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="tileBtn"
+                      onClick={() => setOpenControls(showControls ? '' : stream.roomId)}
+                      title="Camera controls"
+                    >
+                      <Sliders size={15} />
+                      <span>Controls</span>
+                      {showControls ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
+                    </button>
+                  </div>
+                  {showControls && (
+                    <CameraControls
+                      caps={caps}
+                      onChange={(constraints) => sendCameraControl(stream.roomId, constraints)}
+                      onClose={() => setOpenControls('')}
+                    />
+                  )}
                 </div>
               </article>
             )
