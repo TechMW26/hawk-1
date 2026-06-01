@@ -33,12 +33,53 @@ h1 {
   max-width: 70ch;
 }
 
+.cameraControls {
+  margin-bottom: 14px;
+}
+
+.cameraControls label {
+  display: block;
+  margin-bottom: 8px;
+  color: #1f4850;
+  font-weight: 600;
+}
+
+.cameraRow {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.cameraRow select {
+  flex: 1;
+  min-width: 240px;
+  border-radius: 12px;
+  border: 1px solid rgba(19, 63, 72, 0.35);
+  background: rgba(255, 255, 255, 0.85);
+  padding: 11px 12px;
+  font-size: 0.95rem;
+  color: #173c46;
+}
+
+.detectBtn {
+  background: #2f5662;
+}
+
+.cameraHint {
+  margin: 8px 0 0;
+  color: #38626a;
+  font-size: 0.9rem;
+}
+
 .video {
+  display: block;
   width: 100%;
+  height: auto;
+  max-height: 70vh;
   border-radius: 16px;
   background: #111;
-  aspect-ratio: 16 / 9;
-  object-fit: cover;
+  object-fit: contain;
+  object-position: center;
   border: 1px solid rgba(18, 53, 59, 0.26);
 }
 
@@ -117,5 +158,10 @@ button:hover:not(:disabled),
   .card {
     padding: 18px;
     border-radius: 16px;
+  }
+
+  .cameraRow select {
+    min-width: 0;
+    width: 100%;
   }
 }
