@@ -431,6 +431,100 @@ body { color: var(--ink); background: var(--bg); }
   50% { box-shadow: 0 0 0 18px rgba(239,68,68,0); }
 }
 
+.adminDock {
+  display: inline-flex;
+  align-items: stretch;
+  gap: 4px;
+  padding: 6px;
+  background: rgba(20,20,22,0.92);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 18px;
+  box-shadow: 0 14px 36px rgba(0,0,0,0.45);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+.dockBtn {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-width: 72px;
+  padding: 10px 12px;
+  background: transparent;
+  border: 0;
+  border-radius: 12px;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  user-select: none;
+  transition: background 120ms ease, color 120ms ease, transform 120ms ease;
+}
+.dockBtn:hover { background: rgba(255,255,255,0.08); }
+.dockBtn:active { transform: scale(0.96); }
+.dockBtn.is-active { background: #fff; color: var(--ink); }
+.dockBtn-rec { background: var(--danger); color: #fff; }
+.dockBtn-rec:hover { background: #b91c1c; }
+.dockBtn-ptt { touch-action: none; }
+.dockBtn-ptt.speaking {
+  background: var(--danger);
+  color: #fff;
+  animation: ptt-glow 1.2s infinite;
+}
+
+.recBadge-float {
+  position: relative;
+  background: var(--danger);
+  color: #fff;
+  padding: 5px 12px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.recMenu {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  background: rgba(20,20,22,0.96);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 14px;
+  padding: 6px;
+  box-shadow: 0 14px 36px rgba(0,0,0,0.45);
+  min-width: 240px;
+}
+.recMenuItem {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  background: transparent;
+  border: 0;
+  border-radius: 10px;
+  color: #fff;
+  text-align: left;
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+.recMenuItem:hover { background: rgba(255,255,255,0.08); }
+.recMenuTitle { font-size: 13px; font-weight: 700; }
+.recMenuSub { font-size: 11px; color: rgba(255,255,255,0.6); margin-top: 2px; }
+
+.tileRecWrap { position: relative; }
+.recMenu-tile {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  z-index: 10;
+  min-width: 180px;
+}
+
 .toast {
   display: inline-flex;
   align-items: center;
@@ -734,6 +828,26 @@ body { color: var(--ink); background: var(--bg); }
 }
 .ctrlRow input[type="range"] { width: 100%; accent-color: var(--ink); }
 .ctrlRow .input { height: 32px; padding: 0 8px; font-size: 12px; }
+.ctrlSection {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+  margin: 8px 0 4px;
+}
+.ctrlReset {
+  margin-top: 4px;
+  padding: 6px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  background: transparent;
+  border: 1px dashed var(--border-strong);
+  border-radius: 8px;
+  color: var(--ink-mute);
+  cursor: pointer;
+}
+.ctrlReset:hover { color: var(--ink); border-color: var(--ink); }
 
 /* ---------- Pin gate ---------- */
 .pinApp {

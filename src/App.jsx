@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Component, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   BrowserRouter,
   Link,
@@ -163,20 +163,34 @@ const CONTROLLABLE_KEYS = [
   'colorTemperature', 'whiteBalanceMode', 'focusMode', 'exposureMode', 'torch',
 ]
 
-function snapshotCameraCapabilities(track) {
-  if (!track || typeof track.getCapabilities !== 'function') return null
-  let caps = {}
-  let settings = {}
-  try { caps = track.getCapabilities() || {} } catch { caps = {} }
-  try { settings = track.getSettings() || {} } catch { settings = {} }
-  const out = {}
-  CONTROLLABLE_KEYS.forEach((key) => {
-    if (key in caps) {
-      out[key] = { capability: caps[key], current: settings[key] }
-    }
-  })
-  return Object.keys(out).length ? out : null
+function snapshotCameraCapabilities(track, software) {
+  const hw = {}
+  if (track && typeof track.getCapabilities === 'function') {
+    let caps = {}
+    let settings = {}
+    try { caps = track.getCapabilities() || {} } catch { caps = {} }
+    try { settings = track.getSettings() || {} } catch { settings = {} }
+    CONTROLLABLE_KEYS.forEach((key) => {
+      if (key in caps) hw[key] = { capability: caps[key], current: settings[key] }
+    })
+  }
+  return {
+    hardware: Object.keys(hw).length ? hw : null,
+    software: software || { ...DEFAULT_SOFTWARE_SETTINGS },
+  }
 }
+
+const DEFAULT_SOFTWARE_SETTINGS = Object.freeze({
+  brightness: 1, contrast: 1, saturate: 1, exposure: 1, zoom: 1,
+})
+
+const SOFTWARE_RANGES = Object.freeze({
+  brightness: { min: 0.3, max: 2, step: 0.05, label: 'Brightness' },
+  contrast:   { min: 0.3, max: 2, step: 0.05, label: 'Contrast' },
+  saturate:   { min: 0,   max: 2, step: 0.05, label: 'Saturation' },
+  exposure:   { min: 0.3, max: 2.5, step: 0.05, label: 'Exposure' },
+  zoom:       { min: 1,   max: 4, step: 0.1,  label: 'Digital zoom' },
+})
 
 function formatDuration(ms) {
   if (!ms || ms < 0) return '0s'
@@ -199,6 +213,9 @@ function BroadcasterPage() {
   const peerRef = useRef(null)
   const streamRef = useRef(null)
   const previewStreamRef = useRef(null)
+  const rawVideoTrackRef = useRef(null)
+  const softwareSettingsRef = useRef({ ...DEFAULT_SOFTWARE_SETTINGS })
+  const swProcRef = useRef(null)
   const wakeLockRef = useRef(null)
   const statusRef = useRef('idle')
   const activeCallsRef = useRef(new Set())
@@ -327,6 +344,105 @@ function BroadcasterPage() {
       wakeLock.addEventListener('release', () => { wakeLockRef.current = null })
     } catch { /* noop */ }
   }, [])
+
+  const swSettingsAreDefault = useCallback((s) => {
+    return ['brightness','contrast','saturate','exposure','zoom'].every((k) => Math.abs((s[k] ?? 1) - DEFAULT_SOFTWARE_SETTINGS[k]) < 0.001)
+  }, [])
+
+  const teardownSoftwareProcessor = useCallback(() => {
+    const proc = swProcRef.current
+    if (!proc) return
+    if (proc.rafId) cancelAnimationFrame(proc.rafId)
+    if (proc.video) { try { proc.video.pause() } catch { /* noop */ } proc.video.srcObject = null }
+    try { proc.outStream?.getTracks().forEach((t) => t.stop()) } catch { /* noop */ }
+    swProcRef.current = null
+  }, [])
+
+  const buildSoftwareProcessor = useCallback(() => {
+    const raw = rawVideoTrackRef.current
+    if (!raw) return null
+    const settings = raw.getSettings?.() || {}
+    const w = settings.width || 1280
+    const h = settings.height || 720
+    const srcStream = new MediaStream([raw])
+    const video = document.createElement('video')
+    video.srcObject = srcStream
+    video.muted = true
+    video.playsInline = true
+    video.autoplay = true
+    video.play().catch(() => {})
+    const canvas = document.createElement('canvas')
+    canvas.width = w
+    canvas.height = h
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return null
+    const outStream = canvas.captureStream(30)
+    const outTrack = outStream.getVideoTracks()[0]
+    const proc = { video, canvas, ctx, outStream, outTrack, rafId: 0 }
+    const draw = () => {
+      const s = softwareSettingsRef.current
+      try {
+        if (video.readyState >= 2) {
+          const brightness = (s.brightness ?? 1) * (s.exposure ?? 1)
+          const contrast = s.contrast ?? 1
+          const saturate = s.saturate ?? 1
+          ctx.filter = `brightness(${brightness}) contrast(${contrast}) saturate(${saturate})`
+          const z = Math.max(1, s.zoom ?? 1)
+          const sw = canvas.width / z
+          const sh = canvas.height / z
+          const sx = (canvas.width - sw) / 2
+          const sy = (canvas.height - sh) / 2
+          ctx.drawImage(video, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height)
+        }
+      } catch { /* noop */ }
+      proc.rafId = requestAnimationFrame(draw)
+    }
+    proc.rafId = requestAnimationFrame(draw)
+    return proc
+  }, [])
+
+  const replaceVideoTrackOnCalls = useCallback((track) => {
+    activeCallsRef.current.forEach((call) => {
+      const pc = call?.peerConnection
+      if (!pc) return
+      pc.getSenders().forEach((sender) => {
+        if (sender.track && sender.track.kind === 'video') {
+          try { sender.replaceTrack(track) } catch { /* noop */ }
+        }
+      })
+    })
+    // Keep streamRef video track in sync so future calls publish the same track
+    const stream = streamRef.current
+    if (stream && track) {
+      const existing = stream.getVideoTracks()[0]
+      if (existing && existing !== track) {
+        try { stream.removeTrack(existing) } catch { /* noop */ }
+      }
+      if (!stream.getVideoTracks().includes(track)) {
+        try { stream.addTrack(track) } catch { /* noop */ }
+      }
+    }
+  }, [])
+
+  const applySoftwareSettings = useCallback((next) => {
+    softwareSettingsRef.current = { ...softwareSettingsRef.current, ...next }
+    const s = softwareSettingsRef.current
+    if (swSettingsAreDefault(s)) {
+      // Restore raw track
+      if (swProcRef.current) {
+        const raw = rawVideoTrackRef.current
+        teardownSoftwareProcessor()
+        if (raw) replaceVideoTrackOnCalls(raw)
+      }
+      return
+    }
+    if (!swProcRef.current) {
+      const proc = buildSoftwareProcessor()
+      if (!proc) return
+      swProcRef.current = proc
+      replaceVideoTrackOnCalls(proc.outTrack)
+    }
+  }, [swSettingsAreDefault, teardownSoftwareProcessor, buildSoftwareProcessor, replaceVideoTrackOnCalls])
 
   const sendPresence = useCallback(() => {
     adminSlotsRef.current.forEach(({ conn }) => {
@@ -474,6 +590,10 @@ function BroadcasterPage() {
     try {
       const localStream = await acquireStream(desiredCameraId)
       streamRef.current = localStream
+      rawVideoTrackRef.current = localStream.getVideoTracks()[0] || null
+      // Reset software pipeline to defaults on fresh capture
+      softwareSettingsRef.current = { ...DEFAULT_SOFTWARE_SETTINGS }
+      if (swProcRef.current) { teardownSoftwareProcessor() }
       await refreshCameras()
 
       const videoTrack = localStream.getVideoTracks()[0]
@@ -530,14 +650,14 @@ function BroadcasterPage() {
               }
               setTimeout(() => window.location.reload(), 200)
             } else if (data.type === 'camera-control' && data.pin === ADMIN_PIN) {
-              const track = streamRef.current?.getVideoTracks?.()[0]
+              const track = rawVideoTrackRef.current || streamRef.current?.getVideoTracks?.()[0]
               if (!track || typeof track.applyConstraints !== 'function') return
               const constraints = data.constraints && typeof data.constraints === 'object'
                 ? { advanced: [data.constraints] }
                 : null
               if (!constraints) return
               track.applyConstraints(constraints).then(() => {
-                const snap = snapshotCameraCapabilities(track)
+                const snap = snapshotCameraCapabilities(rawVideoTrackRef.current || track, softwareSettingsRef.current)
                 if (conn.open) {
                   try { conn.send({ type: 'camera-capabilities', caps: snap }) } catch { /* noop */ }
                 }
@@ -546,9 +666,16 @@ function BroadcasterPage() {
                   try { conn.send({ type: 'camera-control-error', message: err?.message || 'apply failed' }) } catch { /* noop */ }
                 }
               })
+            } else if (data.type === 'software-control' && data.pin === ADMIN_PIN) {
+              if (data.settings && typeof data.settings === 'object') {
+                applySoftwareSettings(data.settings)
+                const snap = snapshotCameraCapabilities(rawVideoTrackRef.current, softwareSettingsRef.current)
+                if (conn.open) {
+                  try { conn.send({ type: 'camera-capabilities', caps: snap }) } catch { /* noop */ }
+                }
+              }
             } else if (data.type === 'camera-capabilities-request' && data.pin === ADMIN_PIN) {
-              const track = streamRef.current?.getVideoTracks?.()[0]
-              const snap = snapshotCameraCapabilities(track)
+              const snap = snapshotCameraCapabilities(rawVideoTrackRef.current, softwareSettingsRef.current)
               if (conn.open) {
                 try { conn.send({ type: 'camera-capabilities', caps: snap }) } catch { /* noop */ }
               }
@@ -557,8 +684,7 @@ function BroadcasterPage() {
 
           conn.on('open', () => {
             if (isAdminWatch) {
-              const track = streamRef.current?.getVideoTracks?.()[0]
-              const snap = snapshotCameraCapabilities(track)
+              const snap = snapshotCameraCapabilities(rawVideoTrackRef.current, softwareSettingsRef.current)
               try { conn.send({ type: 'camera-capabilities', caps: snap }) } catch { /* noop */ }
             }
             const call = peer.call(conn.peer, streamRef.current || localStream)
@@ -980,7 +1106,10 @@ function ViewerPage() {
   const { roomId = '' } = useParams()
   const [searchParams] = useSearchParams()
   const isAdminMode = useMemo(() => {
-    if (searchParams.get('admin') !== '1') return false
+    // Admin if either explicit ?admin=1 query OR the session has been
+    // unlocked via the /admin PIN gate. This way opening any /watch/:id
+    // tab while signed-in as admin still shows the admin dock.
+    if (searchParams.get('admin') === '0') return false
     try { return sessionStorage.getItem('hawk-admin-unlocked') === '1' } catch { return false }
   }, [searchParams])
   const containerRef = useRef(null)
@@ -992,6 +1121,9 @@ function ViewerPage() {
   const connRef = useRef(null)
   const pttCallRef = useRef(null)
   const pttStreamRef = useRef(null)
+  const recorderRef = useRef(null)
+  const recorderChunksRef = useRef([])
+  const timelapseRef = useRef(null)
   const [status, setStatus] = useState('connecting')
   const [error, setError] = useState('')
   const [isFullscreen, setIsFullscreen] = useState(false)
@@ -1001,6 +1133,10 @@ function ViewerPage() {
   const [caps, setCaps] = useState(null)
   const [showControls, setShowControls] = useState(false)
   const [controlError, setControlError] = useState('')
+  const [isRecording, setIsRecording] = useState(false)
+  const [recordError, setRecordError] = useState('')
+  const [recordMode, setRecordMode] = useState('') // 'normal' | 'timelapse'
+  const [showRecMenu, setShowRecMenu] = useState(false)
 
   useEffect(() => {
     const onFs = () => setIsFullscreen(!!document.fullscreenElement)
@@ -1106,6 +1242,152 @@ function ViewerPage() {
     } catch { /* noop */ }
   }, [])
 
+  const sendSoftwareControl = useCallback((settings) => {
+    const conn = connRef.current
+    if (!conn || !conn.open) return
+    try {
+      conn.send({ type: 'software-control', pin: ADMIN_PIN, settings })
+    } catch { /* noop */ }
+  }, [])
+
+  const pickMimeType = useCallback(() => {
+    const candidates = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm']
+    return candidates.find((m) => {
+      try { return window.MediaRecorder && MediaRecorder.isTypeSupported(m) } catch { return false }
+    })
+  }, [])
+
+  const downloadBlob = useCallback((blob, suffix) => {
+    try {
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `hawk-${roomId}-${suffix}-${new Date().toISOString().replace(/[:.]/g, '-')}.webm`
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+    } catch { /* noop */ }
+  }, [roomId])
+
+  const startRecording = useCallback((mode = 'normal') => {
+    setRecordError('')
+    const stream = videoRef.current?.srcObject
+    if (!stream) { setRecordError('No live stream to record yet.'); return }
+    const mimeType = pickMimeType()
+    if (!mimeType) { setRecordError('Recording is not supported in this browser.'); return }
+
+    if (mode === 'normal') {
+      let recorder
+      try {
+        recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 2_500_000 })
+      } catch { setRecordError('Failed to start recorder.'); return }
+      recorderChunksRef.current = []
+      recorder.ondataavailable = (ev) => {
+        if (ev.data && ev.data.size > 0) recorderChunksRef.current.push(ev.data)
+      }
+      recorder.onstop = () => {
+        const blob = new Blob(recorderChunksRef.current, { type: mimeType })
+        recorderChunksRef.current = []
+        downloadBlob(blob, 'rec')
+      }
+      try {
+        recorder.start(1000)
+        recorderRef.current = recorder
+        setRecordMode('normal')
+        setIsRecording(true)
+      } catch { setRecordError('Failed to start recorder.') }
+      return
+    }
+
+    // Timelapse: draw source frames onto a canvas at an adaptive interval,
+    // then encode the canvas.captureStream at 30fps. Longer recording =>
+    // larger sample interval => bigger speed-up factor.
+    const videoEl = videoRef.current
+    const w = videoEl?.videoWidth || 1280
+    const h = videoEl?.videoHeight || 720
+    const canvas = document.createElement('canvas')
+    canvas.width = w
+    canvas.height = h
+    const ctx = canvas.getContext('2d')
+    if (!ctx) { setRecordError('Canvas not available.'); return }
+    const outFps = 30
+    const outStream = canvas.captureStream(outFps)
+    let recorder
+    try {
+      recorder = new MediaRecorder(outStream, { mimeType, videoBitsPerSecond: 4_000_000 })
+    } catch { setRecordError('Failed to start timelapse recorder.'); return }
+    recorderChunksRef.current = []
+    recorder.ondataavailable = (ev) => {
+      if (ev.data && ev.data.size > 0) recorderChunksRef.current.push(ev.data)
+    }
+    recorder.onstop = () => {
+      const blob = new Blob(recorderChunksRef.current, { type: mimeType })
+      recorderChunksRef.current = []
+      downloadBlob(blob, 'timelapse')
+    }
+
+    // Adaptive sampling: interval grows with elapsed real time so a 1 hour
+    // recording compresses to roughly a couple of minutes regardless of length.
+    // Step pattern (real seconds between sampled frames):
+    //   0–60s   : every 250ms  (4x)
+    //   1–5min  : every 500ms  (15x)
+    //   5–15min : every 1s     (30x)
+    //   15–60min: every 2s     (60x)
+    //   >1h     : every 4s     (120x)
+    const startTs = performance.now()
+    const sampleInterval = () => {
+      const elapsedSec = (performance.now() - startTs) / 1000
+      if (elapsedSec < 60) return 250
+      if (elapsedSec < 300) return 500
+      if (elapsedSec < 900) return 1000
+      if (elapsedSec < 3600) return 2000
+      return 4000
+    }
+    let stopped = false
+    const tick = () => {
+      if (stopped) return
+      try {
+        if (videoEl && videoEl.readyState >= 2) {
+          ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height)
+        }
+      } catch { /* noop */ }
+      timelapseRef.current.timer = setTimeout(tick, sampleInterval())
+    }
+
+    timelapseRef.current = {
+      stop: () => {
+        stopped = true
+        if (timelapseRef.current?.timer) clearTimeout(timelapseRef.current.timer)
+        try { outStream.getTracks().forEach((t) => t.stop()) } catch { /* noop */ }
+      },
+      timer: null,
+    }
+    try {
+      recorder.start(1000)
+      recorderRef.current = recorder
+      setRecordMode('timelapse')
+      setIsRecording(true)
+      tick()
+    } catch {
+      setRecordError('Failed to start timelapse recorder.')
+      timelapseRef.current?.stop()
+      timelapseRef.current = null
+    }
+  }, [pickMimeType, downloadBlob])
+
+  const stopRecording = useCallback(() => {
+    const r = recorderRef.current
+    if (r) { try { r.stop() } catch { /* noop */ } }
+    recorderRef.current = null
+    if (timelapseRef.current) {
+      try { timelapseRef.current.stop() } catch { /* noop */ }
+      timelapseRef.current = null
+    }
+    setIsRecording(false)
+    setRecordMode('')
+  }, [])
+
   useEffect(() => {
     let activeConn = null
     let activeCall = null
@@ -1119,6 +1401,14 @@ function ViewerPage() {
     }
 
     const stopMedia = () => {
+      if (recorderRef.current) {
+        try { recorderRef.current.stop() } catch { /* noop */ }
+        recorderRef.current = null
+      }
+      if (timelapseRef.current) {
+        try { timelapseRef.current.stop() } catch { /* noop */ }
+        timelapseRef.current = null
+      }
       if (!videoRef.current?.srcObject) return
       const s = videoRef.current.srcObject
       s.getTracks().forEach((t) => t.stop())
@@ -1363,29 +1653,9 @@ function ViewerPage() {
                 <AlertTriangle size={14} /> {pttError}
               </div>
             )}
-            {isAdminMode && (
-              <div className="adminBar">
-                <span className="adminBarLabel">
-                  <ShieldCheck size={14} /> Admin controls
-                </span>
-                <button
-                  type="button"
-                  className="iconBtn iconBtn-light"
-                  onClick={handleAdminRefresh}
-                  title="Refresh broadcaster"
-                  aria-label="Refresh broadcaster"
-                >
-                  {refreshSent ? <Check size={16} /> : <RefreshCw size={16} />}
-                </button>
-                <button
-                  type="button"
-                  className={`iconBtn iconBtn-light ${showControls ? 'is-active' : ''}`}
-                  onClick={() => setShowControls((v) => !v)}
-                  title="Camera controls"
-                  aria-label="Camera controls"
-                >
-                  <Sliders size={16} />
-                </button>
+            {isAdminMode && recordError && (
+              <div className="toast">
+                <AlertTriangle size={14} /> {recordError}
               </div>
             )}
             {isAdminMode && showControls && (
@@ -1393,26 +1663,111 @@ function ViewerPage() {
                 {controlError && (
                   <div className="toast"><AlertTriangle size={14} /> {controlError}</div>
                 )}
-                <CameraControls
-                  caps={caps}
-                  onChange={(constraints) => sendCameraControl(constraints)}
-                  onClose={() => setShowControls(false)}
-                />
+                <CameraControlsBoundary onClose={() => setShowControls(false)}>
+                  <CameraControls
+                    caps={caps}
+                    onChange={(constraints) => sendCameraControl(constraints)}
+                    onSoftwareChange={(settings) => sendSoftwareControl(settings)}
+                    onClose={() => setShowControls(false)}
+                  />
+                </CameraControlsBoundary>
               </div>
             )}
-            <button
-              type="button"
-              className={`pttButton ${pttSpeaking ? 'speaking' : ''}`}
-              onPointerDown={(e) => { e.preventDefault(); handlePttDown() }}
-              onPointerUp={handlePttUp}
-              onPointerLeave={handlePttUp}
-              onPointerCancel={handlePttUp}
-              title="Hold to talk"
-              aria-label="Push to talk"
-            >
-              {pttSpeaking ? <Mic size={22} /> : <MicOff size={22} />}
-              <span>{pttSpeaking ? 'Talking' : 'Hold to Talk'}</span>
-            </button>
+            {isAdminMode ? (
+              <div className="adminDock">
+                <button
+                  type="button"
+                  className="dockBtn"
+                  onClick={handleAdminRefresh}
+                  title="Refresh broadcaster"
+                  aria-label="Refresh broadcaster"
+                >
+                  {refreshSent ? <Check size={18} /> : <RefreshCw size={18} />}
+                  <span>{refreshSent ? 'Sent' : 'Refresh'}</span>
+                </button>
+                <button
+                  type="button"
+                  className={`dockBtn ${showControls ? 'is-active' : ''}`}
+                  onClick={() => setShowControls((v) => !v)}
+                  title="Camera controls"
+                  aria-label="Camera controls"
+                >
+                  <Sliders size={18} />
+                  <span>Controls</span>
+                </button>
+                <button
+                  type="button"
+                  className={`dockBtn ${isRecording ? 'dockBtn-rec' : ''}`}
+                  onClick={() => {
+                    if (isRecording) { stopRecording(); return }
+                    setShowRecMenu((v) => !v)
+                  }}
+                  title={isRecording ? 'Stop & save recording' : 'Record locally'}
+                  aria-label="Record"
+                >
+                  {isRecording ? <StopCircle size={18} /> : <Disc size={18} />}
+                  <span>{isRecording ? (recordMode === 'timelapse' ? 'Stop TL' : 'Stop') : 'Record'}</span>
+                </button>
+                <button
+                  type="button"
+                  className={`dockBtn dockBtn-ptt ${pttSpeaking ? 'speaking' : ''}`}
+                  onPointerDown={(e) => { e.preventDefault(); handlePttDown() }}
+                  onPointerUp={handlePttUp}
+                  onPointerLeave={handlePttUp}
+                  onPointerCancel={handlePttUp}
+                  title="Hold to talk"
+                  aria-label="Push to talk"
+                >
+                  {pttSpeaking ? <Mic size={18} /> : <MicOff size={18} />}
+                  <span>{pttSpeaking ? 'Talking' : 'Talk'}</span>
+                </button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                className={`pttButton ${pttSpeaking ? 'speaking' : ''}`}
+                onPointerDown={(e) => { e.preventDefault(); handlePttDown() }}
+                onPointerUp={handlePttUp}
+                onPointerLeave={handlePttUp}
+                onPointerCancel={handlePttUp}
+                title="Hold to talk"
+                aria-label="Push to talk"
+              >
+                {pttSpeaking ? <Mic size={22} /> : <MicOff size={22} />}
+                <span>{pttSpeaking ? 'Talking' : 'Hold to Talk'}</span>
+              </button>
+            )}
+            {isAdminMode && showRecMenu && !isRecording && (
+              <div className="recMenu">
+                <button
+                  type="button"
+                  className="recMenuItem"
+                  onClick={() => { setShowRecMenu(false); startRecording('normal') }}
+                >
+                  <Disc size={16} />
+                  <div>
+                    <div className="recMenuTitle">Normal recording</div>
+                    <div className="recMenuSub">Real-time .webm</div>
+                  </div>
+                </button>
+                <button
+                  type="button"
+                  className="recMenuItem"
+                  onClick={() => { setShowRecMenu(false); startRecording('timelapse') }}
+                >
+                  <Disc size={16} />
+                  <div>
+                    <div className="recMenuTitle">Timelapse</div>
+                    <div className="recMenuSub">Adaptive speed-up by length</div>
+                  </div>
+                </button>
+              </div>
+            )}
+            {isAdminMode && isRecording && (
+              <span className="recBadge recBadge-float">
+                <span className="dot" /> {recordMode === 'timelapse' ? 'REC · TIMELAPSE' : 'REC'}
+              </span>
+            )}
           </div>
         )}
       </div>
@@ -1443,21 +1798,38 @@ function PreviewVideo({ stream }) {
   )
 }
 
-function CameraControls({ caps, onChange, onClose }) {
-  if (!caps) {
-    return (
-      <div className="ctrlPanel">
-        <div className="ctrlHeader">
-          <span><Sliders size={14} /> Camera controls</span>
-          <button type="button" className="iconBtn" onClick={onClose} aria-label="Close">
-            <ChevronUp size={14} />
-          </button>
-        </div>
-        <p className="ctrlEmpty">This camera doesn't expose adjustable controls (or hasn't reported them yet).</p>
-      </div>
-    )
+class CameraControlsBoundary extends Component {
+  constructor(props) {
+    super(props)
+    this.state = { error: null }
   }
-  const entries = Object.entries(caps)
+  static getDerivedStateFromError(error) { return { error } }
+  componentDidCatch(error) { console.error('CameraControls error', error) }
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="ctrlPanel">
+          <div className="ctrlHeader">
+            <span><Sliders size={14} /> Camera controls</span>
+            <button type="button" className="iconBtn" onClick={this.props.onClose} aria-label="Close">
+              <ChevronUp size={14} />
+            </button>
+          </div>
+          <p className="ctrlEmpty">Controls failed to render. Try refreshing the broadcaster.</p>
+        </div>
+      )
+    }
+    return this.props.children
+  }
+}
+
+function CameraControls({ caps, onChange, onSoftwareChange, onClose }) {
+  // Normalize: caps may be legacy hardware-only map, or { hardware, software }
+  const hardware = caps && (caps.hardware !== undefined || caps.software !== undefined)
+    ? caps.hardware
+    : (caps || null)
+  const software = caps && caps.software ? caps.software : null
+  const hwEntries = hardware ? Object.entries(hardware) : []
   return (
     <div className="ctrlPanel">
       <div className="ctrlHeader">
@@ -1466,60 +1838,96 @@ function CameraControls({ caps, onChange, onClose }) {
           <ChevronUp size={14} />
         </button>
       </div>
-      <div className="ctrlList">
-        {entries.map(([key, info]) => {
-          const cap = info.capability
-          const current = info.current
-          // Range capability: { min, max, step }
-          if (cap && typeof cap === 'object' && 'min' in cap && 'max' in cap) {
-            const step = cap.step || (cap.max - cap.min) / 100 || 0.01
-            const val = typeof current === 'number' ? current : cap.min
-            return (
-              <label key={key} className="ctrlRow">
-                <span className="ctrlLabel">{key}</span>
-                <input
-                  type="range"
-                  min={cap.min}
-                  max={cap.max}
-                  step={step}
-                  defaultValue={val}
-                  onChange={(e) => onChange({ [key]: Number(e.target.value) })}
-                />
-                <span className="ctrlValue mono">{val}</span>
-              </label>
-            )
-          }
-          // Enum capability: array of strings
-          if (Array.isArray(cap)) {
-            return (
-              <label key={key} className="ctrlRow">
-                <span className="ctrlLabel">{key}</span>
-                <select
-                  className="input"
-                  defaultValue={current ?? cap[0]}
-                  onChange={(e) => onChange({ [key]: e.target.value })}
-                >
-                  {cap.map((opt) => <option key={opt} value={opt}>{opt}</option>)}
-                </select>
-              </label>
-            )
-          }
-          // Boolean (e.g. torch)
-          if (typeof cap === 'boolean' || (Array.isArray(cap) && cap.every((v) => typeof v === 'boolean'))) {
-            return (
-              <label key={key} className="ctrlRow">
-                <span className="ctrlLabel">{key}</span>
-                <input
-                  type="checkbox"
-                  defaultChecked={!!current}
-                  onChange={(e) => onChange({ [key]: e.target.checked })}
-                />
-              </label>
-            )
-          }
-          return null
-        })}
-      </div>
+      {hwEntries.length === 0 && (
+        <p className="ctrlEmpty">No hardware controls reported by this camera. Use the software adjustments below.</p>
+      )}
+      {hwEntries.length > 0 && (
+        <>
+          <div className="ctrlSection">Hardware</div>
+          <div className="ctrlList">
+            {hwEntries.map(([key, info]) => {
+              const cap = info.capability
+              const current = info.current
+              if (cap && typeof cap === 'object' && 'min' in cap && 'max' in cap) {
+                const step = cap.step || (cap.max - cap.min) / 100 || 0.01
+                const val = typeof current === 'number' ? current : cap.min
+                return (
+                  <label key={key} className="ctrlRow">
+                    <span className="ctrlLabel">{key}</span>
+                    <input
+                      type="range"
+                      min={cap.min}
+                      max={cap.max}
+                      step={step}
+                      defaultValue={val}
+                      onChange={(e) => onChange({ [key]: Number(e.target.value) })}
+                    />
+                    <span className="ctrlValue mono">{val}</span>
+                  </label>
+                )
+              }
+              if (Array.isArray(cap)) {
+                return (
+                  <label key={key} className="ctrlRow">
+                    <span className="ctrlLabel">{key}</span>
+                    <select
+                      className="input"
+                      defaultValue={current ?? cap[0]}
+                      onChange={(e) => onChange({ [key]: e.target.value })}
+                    >
+                      {cap.map((opt) => <option key={opt} value={opt}>{opt}</option>)}
+                    </select>
+                  </label>
+                )
+              }
+              if (typeof cap === 'boolean') {
+                return (
+                  <label key={key} className="ctrlRow">
+                    <span className="ctrlLabel">{key}</span>
+                    <input
+                      type="checkbox"
+                      defaultChecked={!!current}
+                      onChange={(e) => onChange({ [key]: e.target.checked })}
+                    />
+                  </label>
+                )
+              }
+              return null
+            })}
+          </div>
+        </>
+      )}
+      {onSoftwareChange && (
+        <>
+          <div className="ctrlSection">Software</div>
+          <div className="ctrlList">
+            {Object.entries(SOFTWARE_RANGES).map(([key, def]) => {
+              const val = software && typeof software[key] === 'number' ? software[key] : 1
+              return (
+                <label key={key} className="ctrlRow">
+                  <span className="ctrlLabel">{def.label}</span>
+                  <input
+                    type="range"
+                    min={def.min}
+                    max={def.max}
+                    step={def.step}
+                    defaultValue={val}
+                    onChange={(e) => onSoftwareChange({ [key]: Number(e.target.value) })}
+                  />
+                  <span className="ctrlValue mono">{val.toFixed(2)}</span>
+                </label>
+              )
+            })}
+            <button
+              type="button"
+              className="ctrlReset"
+              onClick={() => onSoftwareChange({ ...DEFAULT_SOFTWARE_SETTINGS })}
+            >
+              Reset software adjustments
+            </button>
+          </div>
+        </>
+      )}
     </div>
   )
 }
@@ -1533,6 +1941,8 @@ function AdminDashboard({ onSignOut }) {
   const previewsRef = useRef(new Map())
   const capsRef = useRef(new Map())
   const recordersRef = useRef(new Map())
+  const timelapseRefMap = useRef(new Map())
+  const recordModesRef = useRef(new Map())
   const sweeperRef = useRef(null)
   const pttRef = useRef({ peerId: null, call: null, stream: null })
   const [streams, setStreams] = useState([])
@@ -1545,6 +1955,7 @@ function AdminDashboard({ onSignOut }) {
   const [pttError, setPttError] = useState('')
   const [adoptInput, setAdoptInput] = useState('')
   const [openControls, setOpenControls] = useState('')
+  const [openRecMenu, setOpenRecMenu] = useState('')
   const [recordingRooms, setRecordingRooms] = useState(() => new Set())
 
   const publish = useCallback(() => {
@@ -1609,7 +2020,14 @@ function AdminDashboard({ onSignOut }) {
     catch { /* noop */ }
   }, [])
 
-  const startRecording = useCallback((roomId) => {
+  const sendSoftwareControl = useCallback((roomId, settings) => {
+    const conn = watchConnsRef.current.get(roomId)
+    if (!conn || !conn.open) return
+    try { conn.send({ type: 'software-control', pin: ADMIN_PIN, settings }) }
+    catch { /* noop */ }
+  }, [])
+
+  const startRecording = useCallback((roomId, mode = 'normal') => {
     const stream = previewsRef.current.get(roomId)
     if (!stream) return
     if (recordersRef.current.has(roomId)) return
@@ -1622,42 +2040,105 @@ function AdminDashboard({ onSignOut }) {
     for (const m of mimeCandidates) {
       if (window.MediaRecorder && MediaRecorder.isTypeSupported(m)) { mimeType = m; break }
     }
-    let recorder
-    try {
-      recorder = mimeType
-        ? new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 2_500_000 })
-        : new MediaRecorder(stream)
-    } catch {
-      return
+
+    const buildRecorder = (src, bitrate) => {
+      try {
+        return mimeType
+          ? new MediaRecorder(src, { mimeType, videoBitsPerSecond: bitrate })
+          : new MediaRecorder(src)
+      } catch { return null }
     }
-    const chunks = []
-    recorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data) }
-    recorder.onstop = () => {
+    const finish = (chunks, recorder, suffix) => {
       const blob = new Blob(chunks, { type: recorder.mimeType || 'video/webm' })
       const url = URL.createObjectURL(blob)
       const stamp = new Date().toISOString().replace(/[:.]/g, '-')
       const a = document.createElement('a')
       a.href = url
-      a.download = `hawk-${roomId}-${stamp}.webm`
+      a.download = `hawk-${roomId}-${suffix}-${stamp}.webm`
       document.body.appendChild(a)
       a.click()
       a.remove()
       setTimeout(() => URL.revokeObjectURL(url), 1000)
     }
-    recorder.start(1000)
+
+    if (mode === 'timelapse') {
+      const videoTrack = stream.getVideoTracks()[0]
+      const tsettings = videoTrack?.getSettings?.() || {}
+      const w = tsettings.width || 1280
+      const h = tsettings.height || 720
+      const videoEl = document.createElement('video')
+      videoEl.muted = true
+      videoEl.playsInline = true
+      videoEl.autoplay = true
+      videoEl.srcObject = stream
+      videoEl.play().catch(() => {})
+      const canvas = document.createElement('canvas')
+      canvas.width = w
+      canvas.height = h
+      const ctx = canvas.getContext('2d')
+      if (!ctx) return
+      const outStream = canvas.captureStream(30)
+      const recorder = buildRecorder(outStream, 4_000_000)
+      if (!recorder) return
+      const chunks = []
+      recorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data) }
+      recorder.onstop = () => finish(chunks, recorder, 'timelapse')
+      const startTs = performance.now()
+      const sampleInterval = () => {
+        const elapsedSec = (performance.now() - startTs) / 1000
+        if (elapsedSec < 60) return 250
+        if (elapsedSec < 300) return 500
+        if (elapsedSec < 900) return 1000
+        if (elapsedSec < 3600) return 2000
+        return 4000
+      }
+      let stopped = false
+      const tick = () => {
+        if (stopped) return
+        try {
+          if (videoEl.readyState >= 2) ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height)
+        } catch { /* noop */ }
+        const handle = timelapseRefMap.current.get(roomId)
+        if (handle) handle.timer = setTimeout(tick, sampleInterval())
+      }
+      timelapseRefMap.current.set(roomId, {
+        stop: () => {
+          stopped = true
+          const h2 = timelapseRefMap.current.get(roomId)
+          if (h2?.timer) clearTimeout(h2.timer)
+          try { outStream.getTracks().forEach((t) => t.stop()) } catch { /* noop */ }
+          try { videoEl.pause() } catch { /* noop */ }
+          videoEl.srcObject = null
+        },
+        timer: null,
+      })
+      try { recorder.start(1000) } catch { return }
+      recordersRef.current.set(roomId, recorder)
+      recordModesRef.current.set(roomId, 'timelapse')
+      tick()
+      setRecordingRooms((prev) => { const next = new Set(prev); next.add(roomId); return next })
+      return
+    }
+
+    const recorder = buildRecorder(stream, 2_500_000)
+    if (!recorder) return
+    const chunks = []
+    recorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data) }
+    recorder.onstop = () => finish(chunks, recorder, 'rec')
+    try { recorder.start(1000) } catch { return }
     recordersRef.current.set(roomId, recorder)
-    setRecordingRooms((prev) => {
-      const next = new Set(prev)
-      next.add(roomId)
-      return next
-    })
+    recordModesRef.current.set(roomId, 'normal')
+    setRecordingRooms((prev) => { const next = new Set(prev); next.add(roomId); return next })
   }, [])
 
   const stopRecording = useCallback((roomId) => {
     const recorder = recordersRef.current.get(roomId)
-    if (!recorder) return
-    try { recorder.stop() } catch { /* noop */ }
+    if (recorder) { try { recorder.stop() } catch { /* noop */ } }
     recordersRef.current.delete(roomId)
+    const tl = timelapseRefMap.current.get(roomId)
+    if (tl) { try { tl.stop() } catch { /* noop */ } }
+    timelapseRefMap.current.delete(roomId)
+    recordModesRef.current.delete(roomId)
     setRecordingRooms((prev) => {
       const next = new Set(prev)
       next.delete(roomId)
@@ -1749,13 +2230,17 @@ function AdminDashboard({ onSignOut }) {
   }, [endPttSession])
 
   const handleRefresh = useCallback((room) => {
-    const conn = connsRef.current.get(room.roomId)
-    if (!conn || !conn.open) {
+    const presence = connsRef.current.get(room.roomId)
+    const watch = watchConnsRef.current.get(room.roomId)
+    const conn = (presence && presence.open) ? presence : (watch && watch.open ? watch : null)
+    if (!conn) {
       setAdminError('Broadcaster channel not available for refresh.')
       return
     }
-    try { conn.send({ type: 'admin-refresh' }) }
-    catch { setAdminError('Failed to send refresh command.') }
+    try {
+      conn.send({ type: 'admin-refresh', pin: ADMIN_PIN })
+      setAdminError('')
+    } catch { setAdminError('Failed to send refresh command.') }
   }, [])
 
   const handlePttDown = useCallback(async (room) => {
@@ -2009,7 +2494,7 @@ function AdminDashboard({ onSignOut }) {
           <input
             type="text"
             className="input"
-            placeholder="Add stream by Room ID (e.g. 441cceb2)"
+            placeholder="Add stream by Room ID"
             value={adoptInput}
             onChange={(e) => setAdoptInput(e.target.value)}
             spellCheck={false}
@@ -2037,6 +2522,8 @@ function AdminDashboard({ onSignOut }) {
             const caps = capsRef.current.get(stream.roomId)
             const isRecording = recordingRooms.has(stream.roomId)
             const showControls = openControls === stream.roomId
+            const showRecMenu = openRecMenu === stream.roomId
+            const recordMode = recordModesRef.current.get(stream.roomId) || ''
             void previewsTick
             return (
               <article key={stream.roomId} className="card-stream">
@@ -2091,16 +2578,47 @@ function AdminDashboard({ onSignOut }) {
                     </button>
                   </div>
                   <div className="card-streamActions card-streamActions-sub">
-                    <button
-                      type="button"
-                      className={`tileBtn ${isRecording ? 'tileBtn-rec' : ''}`}
-                      onClick={() => isRecording ? stopRecording(stream.roomId) : startRecording(stream.roomId)}
-                      disabled={!previewStream}
-                      title={previewStream ? (isRecording ? 'Stop & save recording' : 'Record locally') : 'Waiting for preview'}
-                    >
-                      {isRecording ? <StopCircle size={15} /> : <Disc size={15} />}
-                      <span>{isRecording ? 'Stop & Save' : 'Record'}</span>
-                    </button>
+                    <div className="tileRecWrap">
+                      <button
+                        type="button"
+                        className={`tileBtn ${isRecording ? 'tileBtn-rec' : ''}`}
+                        onClick={() => {
+                          if (isRecording) { stopRecording(stream.roomId); return }
+                          setOpenRecMenu(showRecMenu ? '' : stream.roomId)
+                        }}
+                        disabled={!previewStream}
+                        title={previewStream ? (isRecording ? 'Stop & save recording' : 'Record locally') : 'Waiting for preview'}
+                      >
+                        {isRecording ? <StopCircle size={15} /> : <Disc size={15} />}
+                        <span>{isRecording ? (recordMode === 'timelapse' ? 'Stop TL' : 'Stop & Save') : 'Record'}</span>
+                      </button>
+                      {showRecMenu && !isRecording && (
+                        <div className="recMenu recMenu-tile">
+                          <button
+                            type="button"
+                            className="recMenuItem"
+                            onClick={() => { setOpenRecMenu(''); startRecording(stream.roomId, 'normal') }}
+                          >
+                            <Disc size={14} />
+                            <div>
+                              <div className="recMenuTitle">Normal</div>
+                              <div className="recMenuSub">Real-time .webm</div>
+                            </div>
+                          </button>
+                          <button
+                            type="button"
+                            className="recMenuItem"
+                            onClick={() => { setOpenRecMenu(''); startRecording(stream.roomId, 'timelapse') }}
+                          >
+                            <Disc size={14} />
+                            <div>
+                              <div className="recMenuTitle">Timelapse</div>
+                              <div className="recMenuSub">Adaptive speed-up</div>
+                            </div>
+                          </button>
+                        </div>
+                      )}
+                    </div>
                     <button
                       type="button"
                       className="tileBtn"
@@ -2113,11 +2631,14 @@ function AdminDashboard({ onSignOut }) {
                     </button>
                   </div>
                   {showControls && (
-                    <CameraControls
-                      caps={caps}
-                      onChange={(constraints) => sendCameraControl(stream.roomId, constraints)}
-                      onClose={() => setOpenControls('')}
-                    />
+                    <CameraControlsBoundary onClose={() => setOpenControls('')}>
+                      <CameraControls
+                        caps={caps}
+                        onChange={(constraints) => sendCameraControl(stream.roomId, constraints)}
+                        onSoftwareChange={(settings) => sendSoftwareControl(stream.roomId, settings)}
+                        onClose={() => setOpenControls('')}
+                      />
+                    </CameraControlsBoundary>
                   )}
                 </div>
               </article>
