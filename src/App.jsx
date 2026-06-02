@@ -114,6 +114,56 @@ function detectFacing(label) {
   return null
 }
 
+// Read the actual facing direction of a live track. Several Android Chromium
+// builds (notably on Samsung Galaxy Tab devices) omit `facingMode` from
+// getSettings() output, so we fall back to capabilities and finally to the
+// track label.
+function readTrackFacing(track) {
+  if (!track) return null
+  try {
+    const s = track.getSettings?.()
+    if (s && s.facingMode) return s.facingMode
+  } catch { /* noop */ }
+  try {
+    const caps = track.getCapabilities?.()
+    const cf = caps?.facingMode
+    if (Array.isArray(cf) && cf.length === 1) return cf[0]
+    if (typeof cf === 'string') return cf
+  } catch { /* noop */ }
+  return detectFacing(track.label || '')
+}
+
+// One-time probe to learn which physical deviceId corresponds to each facing.
+// On Android (especially Samsung tablets) enumerateDevices() returns multiple
+// "back" lens entries, only one of which actually streams; the labels are
+// often opaque ("camera2 0"). The only reliable way to map facing -> deviceId
+// is to ask the browser, then inspect what it gave us. Each probe runs
+// sequentially because Android browsers can't hold two cameras open at once.
+async function probeCameraFacings() {
+  const results = { environment: null, user: null }
+  for (const facing of ['environment', 'user']) {
+    let stream = null
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: facing } },
+      })
+      const track = stream.getVideoTracks()[0]
+      const settings = (track && track.getSettings?.()) || {}
+      const observedFacing = readTrackFacing(track)
+      results[facing] = {
+        deviceId: settings.deviceId || null,
+        groupId: settings.groupId || null,
+        label: (track && track.label) || '',
+        observedFacing,
+      }
+    } catch { /* probe failed: this facing isn't available */ }
+    if (stream) {
+      try { stream.getTracks().forEach((t) => t.stop()) } catch { /* noop */ }
+    }
+  }
+  return results
+}
+
 const IS_MOBILE_UA = /Android|iPhone|iPad|iPod/i
 
 // Build the ordered list of MediaTrackConstraints attempts for a given camera
@@ -172,14 +222,13 @@ async function acquireStream(camera) {
 
   let lastError = null
   for (const video of videoAttempts) {
+    let stream = null
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video, audio })
+      stream = await navigator.mediaDevices.getUserMedia({ video, audio })
       // Verify we actually got the requested facing. Some Android browsers
       // ignore deviceId constraints and hand back the default (front) camera.
       if (facing) {
-        const track = stream.getVideoTracks()[0]
-        const settings = track?.getSettings?.() || {}
-        const got = settings.facingMode
+        const got = readTrackFacing(stream.getVideoTracks()[0])
         if (got && got !== facing) {
           stream.getTracks().forEach((t) => t.stop())
           continue
@@ -187,6 +236,9 @@ async function acquireStream(camera) {
       }
       return stream
     } catch (err) {
+      if (stream) {
+        try { stream.getTracks().forEach((t) => t.stop()) } catch { /* noop */ }
+      }
       lastError = err
       if (err && (err.name === 'NotAllowedError' || err.name === 'SecurityError')) {
         break
@@ -201,7 +253,7 @@ async function acquireStream(camera) {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video: fallback })
       if (facing) {
-        const got = stream.getVideoTracks()[0]?.getSettings?.().facingMode
+        const got = readTrackFacing(stream.getVideoTracks()[0])
         if (got && got !== facing) {
           stream.getTracks().forEach((t) => t.stop())
           throw new Error(`Requested ${facing} camera but received ${got}`)
@@ -294,6 +346,8 @@ function BroadcasterPage() {
   const streamRef = useRef(null)
   const previewStreamRef = useRef(null)
   const camerasRef = useRef([])
+  const facingProbeRef = useRef(null)
+  const facingProbePromiseRef = useRef(null)
   const rawVideoTrackRef = useRef(null)
   const softwareSettingsRef = useRef({ ...DEFAULT_SOFTWARE_SETTINGS })
   const swProcRef = useRef(null)
@@ -336,24 +390,12 @@ function BroadcasterPage() {
 
     let entries
     if (isMobile) {
-      // Android/iOS commonly enumerate every physical lens (main / wide /
-      // ultrawide / macro / telephoto) as a separate device — but on many
-      // phones (e.g. Samsung S10 Lite Tab) only the default lens per facing
-      // can actually stream. Collapse them into one logical option per
-      // facing direction so the user picks "Back" vs "Front", and we keep
-      // every underlying deviceId as a fallback candidate.
-      const buckets = { environment: [], user: [], unknown: [] }
-      videoInputs.forEach((d) => {
-        const f = detectFacing(d.label)
-        if (f) buckets[f].push(d)
-        else buckets.unknown.push(d)
-      })
-      const labelsKnown = buckets.environment.length > 0 || buckets.user.length > 0
-
-      if (!labelsKnown) {
-        // No permission yet → no labels → can't group safely. Show one
-        // generic entry so the user can grant permission; refreshCameras
-        // will run again afterwards and group properly.
+      // We can only group reliably once labels are populated (which requires
+      // permission). Without permission, emit one generic entry per device so
+      // the user can grant permission; a follow-up refresh after permission
+      // will replace this list with proper Back/Front entries.
+      const anyLabel = videoInputs.some((d) => d.label)
+      if (!anyLabel) {
         entries = videoInputs.map((d, index) => ({
           deviceId: d.deviceId,
           candidateIds: [d.deviceId],
@@ -362,26 +404,69 @@ function BroadcasterPage() {
           isUsb: false, isBuiltIn: true,
         }))
       } else {
+        // Reuse a cached probe if we have one; otherwise probe (serialized so
+        // concurrent refreshes share the same probe).
+        if (!facingProbeRef.current && !facingProbePromiseRef.current) {
+          facingProbePromiseRef.current = probeCameraFacings()
+            .then((r) => { facingProbeRef.current = r; return r })
+            .catch(() => { facingProbeRef.current = { environment: null, user: null }; return facingProbeRef.current })
+            .finally(() => { facingProbePromiseRef.current = null })
+        }
+        if (facingProbePromiseRef.current) {
+          await facingProbePromiseRef.current
+          // Devices list may have new labels now — re-enumerate.
+          const fresh = await navigator.mediaDevices.enumerateDevices()
+          videoInputs.length = 0
+          fresh.filter((d) => d.kind === 'videoinput').forEach((d) => videoInputs.push(d))
+        }
+        const probe = facingProbeRef.current || { environment: null, user: null }
+
+        // Bucket every enumerated device by facing using BOTH the probe result
+        // (authoritative) and the label heuristic (covers the case where the
+        // probe could not run, e.g. only one facing exists).
+        const back = []
+        const front = []
+        const unknown = []
+        videoInputs.forEach((d) => {
+          const labelFacing = detectFacing(d.label)
+          const matchesBackProbe = probe.environment && (
+            probe.environment.deviceId === d.deviceId ||
+            (probe.environment.groupId && probe.environment.groupId === d.groupId)
+          )
+          const matchesFrontProbe = probe.user && (
+            probe.user.deviceId === d.deviceId ||
+            (probe.user.groupId && probe.user.groupId === d.groupId)
+          )
+          if (matchesBackProbe || labelFacing === 'environment') back.push(d)
+          else if (matchesFrontProbe || labelFacing === 'user') front.push(d)
+          else unknown.push(d)
+        })
+
+        // Use probe deviceIds first — those are guaranteed to actually open as
+        // the requested facing. Other matching deviceIds become fallbacks.
+        const buildEntry = (probed, bucket, facing, label) => {
+          if (!probed && bucket.length === 0) return null
+          const primaryId = probed?.deviceId || bucket[0].deviceId
+          const ids = []
+          if (primaryId) ids.push(primaryId)
+          bucket.forEach((d) => {
+            if (d.deviceId && !ids.includes(d.deviceId)) ids.push(d.deviceId)
+          })
+          return {
+            deviceId: primaryId,
+            candidateIds: ids,
+            label,
+            facing,
+            isUsb: false, isBuiltIn: true,
+          }
+        }
+
         entries = []
-        if (buckets.environment.length) {
-          entries.push({
-            deviceId: buckets.environment[0].deviceId,
-            candidateIds: buckets.environment.map((d) => d.deviceId),
-            label: 'Back camera',
-            facing: 'environment',
-            isUsb: false, isBuiltIn: true,
-          })
-        }
-        if (buckets.user.length) {
-          entries.push({
-            deviceId: buckets.user[0].deviceId,
-            candidateIds: buckets.user.map((d) => d.deviceId),
-            label: 'Front camera',
-            facing: 'user',
-            isUsb: false, isBuiltIn: true,
-          })
-        }
-        buckets.unknown.forEach((d, i) => {
+        const backEntry = buildEntry(probe.environment, back, 'environment', 'Back camera')
+        if (backEntry) entries.push(backEntry)
+        const frontEntry = buildEntry(probe.user, front, 'user', 'Front camera')
+        if (frontEntry) entries.push(frontEntry)
+        unknown.forEach((d, i) => {
           entries.push({
             deviceId: d.deviceId,
             candidateIds: [d.deviceId],
@@ -390,6 +475,18 @@ function BroadcasterPage() {
             isUsb: false, isBuiltIn: true,
           })
         })
+
+        // Final safety net: if neither facing was identified (probe failed AND
+        // labels were uninformative) just expose every device individually.
+        if (entries.length === 0) {
+          entries = videoInputs.map((d, index) => ({
+            deviceId: d.deviceId,
+            candidateIds: [d.deviceId],
+            label: d.label || `Camera ${index + 1}`,
+            facing: null,
+            isUsb: false, isBuiltIn: true,
+          }))
+        }
       }
     } else {
       entries = videoInputs.map((d, index) => {
@@ -428,6 +525,11 @@ function BroadcasterPage() {
       const probe = await navigator.mediaDevices.getUserMedia({ video: true, audio: false })
       probe.getTracks().forEach((t) => t.stop())
     } catch { /* noop */ }
+    // Force a fresh facing probe — useful if the user just plugged in or
+    // toggled a camera, or if the prior probe ran before permission was
+    // granted and so could not identify both facings.
+    facingProbeRef.current = null
+    facingProbePromiseRef.current = null
     await refreshCameras()
   }, [refreshCameras])
 
@@ -1161,20 +1263,35 @@ function BroadcasterPage() {
         (cameraEntry.deviceId === currentLive || cameraEntry.candidateIds?.includes(currentLive))
       ) return
       ;(async () => {
+        const isMobile = IS_MOBILE_UA.test(navigator.userAgent || '')
+        const oldRaw = rawVideoTrackRef.current
+        // Android/iOS browsers can't hold two cameras open at once. If we keep
+        // the old camera's track alive while requesting the new one, the
+        // browser frequently returns the same (often front) camera. Tear
+        // down the software processor and stop the old raw track FIRST.
+        if (isMobile) {
+          teardownSoftwareProcessor()
+          try { oldRaw && oldRaw.stop() } catch { /* noop */ }
+          rawVideoTrackRef.current = null
+        }
         try {
           const newStream = await acquireStream(cameraEntry)
           const newTrack = newStream.getVideoTracks()[0]
           if (!newTrack) { newStream.getTracks().forEach((t) => t.stop()); return }
           // Discard newly acquired audio — keep the original mic.
           newStream.getAudioTracks().forEach((t) => t.stop())
-          // Tear down software processor (if any) and stop the old raw track.
-          teardownSoftwareProcessor()
-          const oldRaw = rawVideoTrackRef.current
+          if (!isMobile) {
+            // On desktop we deferred teardown to keep the broadcast frame-rate
+            // continuous up to the swap; tear down now.
+            teardownSoftwareProcessor()
+          }
           rawVideoTrackRef.current = newTrack
           softwareSettingsRef.current = { ...DEFAULT_SOFTWARE_SETTINGS }
           replaceVideoTrackOnCalls(newTrack)
           if (previewRef.current) previewRef.current.srcObject = streamRef.current
-          try { oldRaw && oldRaw.stop() } catch { /* noop */ }
+          if (!isMobile) {
+            try { oldRaw && oldRaw.stop() } catch { /* noop */ }
+          }
           const settings = newTrack.getSettings() || {}
           if (settings.width && settings.height) {
             const fps = Math.round(settings.frameRate || 0)
