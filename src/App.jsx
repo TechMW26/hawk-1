@@ -107,6 +107,7 @@ async function acquireStream(deviceId) {
     noiseSuppression: true,
     autoGainControl: true,
   }
+  const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent || '')
   const videoAttempts = []
   if (deviceId) {
     videoAttempts.push({
@@ -120,6 +121,15 @@ async function acquireStream(deviceId) {
     videoAttempts.push({ deviceId: { exact: deviceId } })
     videoAttempts.push({ deviceId })
   }
+  if (isMobile) {
+    // facingMode is the only reliable selector on iOS Safari before label-unlock.
+    videoAttempts.push({
+      facingMode: { ideal: 'environment' },
+      width: { ideal: 1280 }, height: { ideal: 720 },
+    })
+    videoAttempts.push({ facingMode: 'environment' })
+    videoAttempts.push({ facingMode: 'user' })
+  }
   videoAttempts.push({ width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30, max: 30 } })
   videoAttempts.push({ width: { ideal: 640 }, height: { ideal: 480 } })
   videoAttempts.push(true)
@@ -131,6 +141,12 @@ async function acquireStream(deviceId) {
     } catch (err) {
       lastError = err
     }
+  }
+  // Last resort: audio-less video (some iOS scenarios reject combined access).
+  try {
+    return await navigator.mediaDevices.getUserMedia({ video: true })
+  } catch (err) {
+    lastError = err
   }
   throw lastError || new Error('Unable to access camera')
 }
@@ -506,11 +522,22 @@ function BroadcasterPage() {
       } catch {
         return
       }
-      const slot = { conn, heartbeat: null }
+      const slot = { conn, heartbeat: null, openTimer: null }
       adminSlotsRef.current.set(slotId, slot)
+
+      // If the admin slot isn't claimed, PeerJS fires `peer-unavailable` on the
+      // peer (not the conn), so this conn would silently never open. Force a
+      // cleanup after 4s so the retry loop will try again.
+      slot.openTimer = setTimeout(() => {
+        if (!conn.open) {
+          try { conn.close() } catch { /* noop */ }
+          cleanup()
+        }
+      }, 4000)
 
       const cleanup = () => {
         if (slot.heartbeat) { clearInterval(slot.heartbeat); slot.heartbeat = null }
+        if (slot.openTimer) { clearTimeout(slot.openTimer); slot.openTimer = null }
         if (adminSlotsRef.current.get(slotId) === slot) {
           adminSlotsRef.current.delete(slotId)
         }
@@ -525,6 +552,7 @@ function BroadcasterPage() {
       }
 
       conn.on('open', () => {
+        if (slot.openTimer) { clearTimeout(slot.openTimer); slot.openTimer = null }
         try {
           conn.send({
             type: 'presence',
@@ -767,12 +795,15 @@ function BroadcasterPage() {
           ])
           if (nonFatal.has(peerError?.type)) {
             if (peerError?.type === 'peer-unavailable') {
-              closeAdminPresence()
-              if (adminRetryRef.current) clearTimeout(adminRetryRef.current)
-              adminRetryRef.current = setTimeout(
-                () => connectAdminPresenceRef.current(),
-                ADMIN_RETRY_MS
-              )
+              // A pending admin-slot or PTT conn target is unclaimed.
+              // Don't tear down healthy slots — the per-slot open-timer will
+              // clean up any pending conns and the retry loop will try again.
+              if (!adminRetryRef.current) {
+                adminRetryRef.current = setTimeout(
+                  () => connectAdminPresenceRef.current(),
+                  ADMIN_RETRY_MS
+                )
+              }
             } else {
               setError(`${peerError.message || 'Signaling issue'} — retrying...`)
             }
@@ -897,14 +928,43 @@ function BroadcasterPage() {
     }
   }, [refreshCameras, releaseWakeLock, requestWakeLock, closeAdminPresence, acquirePreview])
 
-  // When camera selection changes (and we're not live), swap the preview.
+  // When camera selection changes, swap the preview or live track.
   useEffect(() => {
-    if (statusRef.current === 'live' || statusRef.current === 'starting') return
+    if (statusRef.current === 'starting') return
     if (!selectedCameraId) return
+    if (statusRef.current === 'live') {
+      const currentLive = streamRef.current?.getVideoTracks?.()[0]?.getSettings?.().deviceId
+      if (currentLive === selectedCameraId) return
+      ;(async () => {
+        try {
+          const newStream = await acquireStream(selectedCameraId)
+          const newTrack = newStream.getVideoTracks()[0]
+          if (!newTrack) { newStream.getTracks().forEach((t) => t.stop()); return }
+          // Discard newly acquired audio — keep the original mic.
+          newStream.getAudioTracks().forEach((t) => t.stop())
+          // Tear down software processor (if any) and stop the old raw track.
+          teardownSoftwareProcessor()
+          const oldRaw = rawVideoTrackRef.current
+          rawVideoTrackRef.current = newTrack
+          softwareSettingsRef.current = { ...DEFAULT_SOFTWARE_SETTINGS }
+          replaceVideoTrackOnCalls(newTrack)
+          if (previewRef.current) previewRef.current.srcObject = streamRef.current
+          try { oldRaw && oldRaw.stop() } catch { /* noop */ }
+          const settings = newTrack.getSettings() || {}
+          if (settings.width && settings.height) {
+            const fps = Math.round(settings.frameRate || 0)
+            setResolution(`${settings.width}×${settings.height}${fps ? ` @ ${fps}fps` : ''}`)
+          }
+        } catch {
+          setError('Could not switch to the selected camera.')
+        }
+      })()
+      return
+    }
     const current = previewStreamRef.current?.getVideoTracks?.()[0]?.getSettings?.().deviceId
     if (current === selectedCameraId) return
     void acquirePreview(selectedCameraId)
-  }, [selectedCameraId, acquirePreview])
+  }, [selectedCameraId, acquirePreview, replaceVideoTrackOnCalls, teardownSoftwareProcessor])
 
   const isLive = status === 'live'
   const isStarting = status === 'starting'
@@ -2332,19 +2392,11 @@ function AdminDashboard({ onSignOut }) {
           watchCallsRef.current.set(call.peer, call)
           previewFailuresRef.current.delete(call.peer)
           rememberRoom(call.peer)
-          const onTrackEnded = () => {
-            // Broadcaster stopped — drop the tile entirely.
-            const entry = streamsRef.current.get(call.peer)
-            dropPreview(call.peer)
-            if (entry?.adopted) forgetRoom(call.peer)
-            else {
-              streamsRef.current.delete(call.peer)
-              connsRef.current.delete(call.peer)
-            }
-            publish()
-          }
-          remote.getTracks().forEach((t) => { t.onended = onTrackEnded })
-          remote.oninactive = onTrackEnded
+          // When the remote stream stops, just drop the preview. The sweeper
+          // will retry; if the broadcaster is truly gone the failure counter
+          // will forget the room on its own.
+          const onInactive = () => { dropPreview(call.peer) }
+          remote.oninactive = onInactive
           if (!streamsRef.current.has(call.peer)) {
             streamsRef.current.set(call.peer, {
               roomId: call.peer,
@@ -2367,11 +2419,8 @@ function AdminDashboard({ onSignOut }) {
             watchCallsRef.current.delete(call.peer)
             previewsRef.current.delete(call.peer)
             setPreviewsTick((t) => t + 1)
-            const entry = streamsRef.current.get(call.peer)
-            if (entry?.adopted) {
-              forgetRoom(call.peer)
-              publish()
-            }
+            // Don't forget the room here — sweeper retries preview; if the
+            // broadcaster is really gone, failure counter prunes it.
           }
         }
         call.on('close', stop)
