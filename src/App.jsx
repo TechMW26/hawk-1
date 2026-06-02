@@ -109,6 +109,18 @@ async function acquireStream(deviceId) {
   }
   const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent || '')
   const videoAttempts = []
+  // On mobile, deviceId from a previous session is often stale after reload
+  // (Android randomizes per-session ids until permission is granted). Prefer
+  // facingMode-based attempts FIRST so we always get *some* camera, then fall
+  // back to the saved deviceId if it still exists.
+  if (isMobile) {
+    videoAttempts.push({
+      facingMode: { ideal: 'environment' },
+      width: { ideal: 1280 }, height: { ideal: 720 },
+    })
+    videoAttempts.push({ facingMode: 'environment' })
+    videoAttempts.push({ facingMode: 'user' })
+  }
   if (deviceId) {
     videoAttempts.push({
       deviceId: { exact: deviceId },
@@ -121,15 +133,6 @@ async function acquireStream(deviceId) {
     videoAttempts.push({ deviceId: { exact: deviceId } })
     videoAttempts.push({ deviceId })
   }
-  if (isMobile) {
-    // facingMode is the only reliable selector on iOS Safari before label-unlock.
-    videoAttempts.push({
-      facingMode: { ideal: 'environment' },
-      width: { ideal: 1280 }, height: { ideal: 720 },
-    })
-    videoAttempts.push({ facingMode: 'environment' })
-    videoAttempts.push({ facingMode: 'user' })
-  }
   videoAttempts.push({ width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30, max: 30 } })
   videoAttempts.push({ width: { ideal: 640 }, height: { ideal: 480 } })
   videoAttempts.push(true)
@@ -140,13 +143,19 @@ async function acquireStream(deviceId) {
       return await navigator.mediaDevices.getUserMedia({ video, audio })
     } catch (err) {
       lastError = err
+      // If the user denied permission, no point trying other constraints.
+      if (err && (err.name === 'NotAllowedError' || err.name === 'SecurityError')) {
+        break
+      }
     }
   }
-  // Last resort: audio-less video (some iOS scenarios reject combined access).
-  try {
-    return await navigator.mediaDevices.getUserMedia({ video: true })
-  } catch (err) {
-    lastError = err
+  // Last resort: video-only (some Android browsers reject combined access).
+  if (!lastError || (lastError.name !== 'NotAllowedError' && lastError.name !== 'SecurityError')) {
+    try {
+      return await navigator.mediaDevices.getUserMedia({ video: true })
+    } catch (err) {
+      lastError = err
+    }
   }
   throw lastError || new Error('Unable to access camera')
 }
@@ -320,12 +329,30 @@ function BroadcasterPage() {
         }
         stopPreviewStream()
       }
-      const next = await navigator.mediaDevices.getUserMedia({
-        video: target
-          ? { deviceId: { exact: target } }
-          : { width: { ideal: 1280 }, height: { ideal: 720 } },
-        audio: false,
-      })
+      const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent || '')
+      const attempts = []
+      if (target) {
+        attempts.push({ video: { deviceId: { exact: target } }, audio: false })
+        attempts.push({ video: { deviceId: target }, audio: false })
+      }
+      if (isMobile) {
+        attempts.push({ video: { facingMode: { ideal: 'environment' } }, audio: false })
+        attempts.push({ video: { facingMode: 'environment' }, audio: false })
+        attempts.push({ video: { facingMode: 'user' }, audio: false })
+      }
+      attempts.push({ video: { width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false })
+      attempts.push({ video: true, audio: false })
+
+      let next = null
+      let lastErr = null
+      for (const c of attempts) {
+        try { next = await navigator.mediaDevices.getUserMedia(c); break }
+        catch (err) {
+          lastErr = err
+          if (err && (err.name === 'NotAllowedError' || err.name === 'SecurityError')) break
+        }
+      }
+      if (!next) throw lastErr || new Error('Unable to access camera')
       // Race-safe: if we went live during await, drop this stream.
       if (statusRef.current === 'live' || statusRef.current === 'starting') {
         next.getTracks().forEach((t) => t.stop())
@@ -341,8 +368,11 @@ function BroadcasterPage() {
       }
       // Refresh labels in case this was the first permission grant.
       await refreshCameras()
-    } catch {
+    } catch (err) {
       setHasPreview(false)
+      if (err && (err.name === 'NotAllowedError' || err.name === 'SecurityError')) {
+        setError('Camera permission was denied. Tap "Enable camera" to retry.')
+      }
     }
   }, [selectedCameraId, refreshCameras, stopPreviewStream])
 
@@ -823,8 +853,19 @@ function BroadcasterPage() {
       }
 
       createPeer()
-    } catch {
-      setError('Camera/microphone permission is required to go live.')
+    } catch (err) {
+      if (err?.name === 'NotAllowedError' || err?.name === 'SecurityError') {
+        setError('Camera permission was denied. Tap the camera icon in the address bar to allow, then try again.')
+      } else if (err?.name === 'NotFoundError' || err?.name === 'OverconstrainedError') {
+        // Stale saved cameraId after Android reload: forget it so the next
+        // attempt uses facingMode and succeeds.
+        clearResumeSession()
+        setError('Couldn\u2019t start the saved camera. Tap Go Live again to pick a working one.')
+      } else if (err?.name === 'NotReadableError') {
+        setError('Camera is in use by another app. Close it and try again.')
+      } else {
+        setError(err?.message || 'Unable to access camera.')
+      }
       setStatus('idle')
     }
   }, [
