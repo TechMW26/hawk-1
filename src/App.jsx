@@ -1987,6 +1987,20 @@ function AdminDashboard({ onSignOut }) {
     setPreviewsTick((t) => t + 1)
   }, [])
 
+  const forgetRoom = useCallback((roomId) => {
+    streamsRef.current.delete(roomId)
+    connsRef.current.delete(roomId)
+    previewFailuresRef.current.delete(roomId)
+    try {
+      const raw = localStorage.getItem('hawk-admin-known-rooms')
+      const list = raw ? JSON.parse(raw) : []
+      if (Array.isArray(list)) {
+        const next = list.filter((r) => r !== roomId)
+        localStorage.setItem('hawk-admin-known-rooms', JSON.stringify(next))
+      }
+    } catch { /* noop */ }
+  }, [])
+
   const requestPreview = useCallback((roomId) => {
     const peer = peerRef.current
     if (!peer || peer.destroyed) return
@@ -1996,7 +2010,21 @@ function AdminDashboard({ onSignOut }) {
       conn = peer.connect(roomId, { reliable: true, metadata: { kind: 'admin-watch' } })
     } catch { return }
     watchConnsRef.current.set(roomId, conn)
+    let opened = false
+    const openTimer = setTimeout(() => {
+      if (!opened) {
+        // Broker never confirmed the peer — count as a failure.
+        const n = (previewFailuresRef.current.get(roomId) || 0) + 1
+        previewFailuresRef.current.set(roomId, n)
+        try { conn.close() } catch { /* noop */ }
+        if (watchConnsRef.current.get(roomId) === conn) {
+          watchConnsRef.current.delete(roomId)
+        }
+      }
+    }, 4000)
     conn.on('open', () => {
+      opened = true
+      clearTimeout(openTimer)
       previewFailuresRef.current.delete(roomId)
       try { conn.send({ type: 'camera-capabilities-request', pin: ADMIN_PIN }) } catch { /* noop */ }
     })
@@ -2008,11 +2036,13 @@ function AdminDashboard({ onSignOut }) {
       }
     })
     const cleanup = () => {
+      clearTimeout(openTimer)
       if (watchConnsRef.current.get(roomId) === conn) {
         watchConnsRef.current.delete(roomId)
       }
     }
     const recordFailure = () => {
+      clearTimeout(openTimer)
       const n = (previewFailuresRef.current.get(roomId) || 0) + 1
       previewFailuresRef.current.set(roomId, n)
       cleanup()
@@ -2300,7 +2330,21 @@ function AdminDashboard({ onSignOut }) {
         call.on('stream', (remote) => {
           previewsRef.current.set(call.peer, remote)
           watchCallsRef.current.set(call.peer, call)
+          previewFailuresRef.current.delete(call.peer)
           rememberRoom(call.peer)
+          const onTrackEnded = () => {
+            // Broadcaster stopped — drop the tile entirely.
+            const entry = streamsRef.current.get(call.peer)
+            dropPreview(call.peer)
+            if (entry?.adopted) forgetRoom(call.peer)
+            else {
+              streamsRef.current.delete(call.peer)
+              connsRef.current.delete(call.peer)
+            }
+            publish()
+          }
+          remote.getTracks().forEach((t) => { t.onended = onTrackEnded })
+          remote.oninactive = onTrackEnded
           if (!streamsRef.current.has(call.peer)) {
             streamsRef.current.set(call.peer, {
               roomId: call.peer,
@@ -2323,6 +2367,11 @@ function AdminDashboard({ onSignOut }) {
             watchCallsRef.current.delete(call.peer)
             previewsRef.current.delete(call.peer)
             setPreviewsTick((t) => t + 1)
+            const entry = streamsRef.current.get(call.peer)
+            if (entry?.adopted) {
+              forgetRoom(call.peer)
+              publish()
+            }
           }
         }
         call.on('close', stop)
@@ -2439,21 +2488,10 @@ function AdminDashboard({ onSignOut }) {
         const failures = previewFailuresRef.current.get(key) || 0
         if (entry.adopted) {
           // Adopted entries are kept alive by the preview call, not presence.
-          // Drop if we've failed to reach the broadcaster a few times in a row
+          // Drop if we've failed to reach the broadcaster a couple of times
           // and we don't currently have a live preview stream.
-          if (!hasPreview && failures >= 3) {
-            streamsRef.current.delete(key)
-            connsRef.current.delete(key)
-            capsRef.current.delete(key)
-            previewFailuresRef.current.delete(key)
-            try {
-              const raw = localStorage.getItem('hawk-admin-known-rooms')
-              const list = raw ? JSON.parse(raw) : []
-              if (Array.isArray(list)) {
-                const next = list.filter((r) => r !== key)
-                localStorage.setItem('hawk-admin-known-rooms', JSON.stringify(next))
-              }
-            } catch { /* noop */ }
+          if (!hasPreview && failures >= 2) {
+            forgetRoom(key)
             changed = true
             return
           }
