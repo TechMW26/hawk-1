@@ -1,4 +1,5 @@
 import { Component, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import {
   BrowserRouter,
   Link,
@@ -965,6 +966,9 @@ function BroadcasterPage() {
     const desiredCameraId = override.cameraId || selectedCameraId
 
     // Release preview-only stream so live capture can claim the camera.
+    // On Android the OS only supports one camera open at a time, so this
+    // MUST happen before any getUserMedia call below — otherwise the new
+    // request returns the same (often wrong) camera that the preview owns.
     if (previewStreamRef.current) {
       previewStreamRef.current.getTracks().forEach((t) => t.stop())
       previewStreamRef.current = null
@@ -972,7 +976,20 @@ function BroadcasterPage() {
     }
 
     try {
+      // Ensure the camera list is populated before resolving the saved id —
+      // critical for the auto-resume path on page reload, where the saved
+      // cameraId would otherwise resolve to nothing on a fresh component.
+      if (!camerasRef.current || camerasRef.current.length === 0) {
+        try { await refreshCameras() } catch { /* noop */ }
+      }
       const cameraEntry = resolveCameraEntry(desiredCameraId)
+      // Final guard: another async preview acquire may have completed
+      // between our top-of-function stop and now. Stop it again.
+      if (previewStreamRef.current) {
+        previewStreamRef.current.getTracks().forEach((t) => t.stop())
+        previewStreamRef.current = null
+        setHasPreview(false)
+      }
       const localStream = await acquireStream(cameraEntry)
       streamRef.current = localStream
       rawVideoTrackRef.current = localStream.getVideoTracks()[0] || null
@@ -983,7 +1000,12 @@ function BroadcasterPage() {
 
       const videoTrack = localStream.getVideoTracks()[0]
       const settings = videoTrack?.getSettings() || {}
-      if (settings.deviceId) setSelectedCameraId(settings.deviceId)
+      // Prefer the resolved entry's id (which is the facing sentinel on
+      // mobile) so the camera dropdown stays in sync and reload can
+      // re-resolve deterministically. Fall back to the raw track deviceId
+      // for desktop / USB cameras where there's no sentinel.
+      const stableCameraId = cameraEntry?.deviceId || settings.deviceId || ''
+      if (stableCameraId) setSelectedCameraId(stableCameraId)
       if (settings.width && settings.height) {
         const fps = Math.round(settings.frameRate || 0)
         setResolution(`${settings.width}×${settings.height}${fps ? ` @ ${fps}fps` : ''}`)
@@ -1000,7 +1022,7 @@ function BroadcasterPage() {
       writeResumeSession({
         roomId: desiredRoomId,
         title: desiredTitle,
-        cameraId: settings.deviceId || desiredCameraId,
+        cameraId: stableCameraId || desiredCameraId,
         savedAt: Date.now(),
       })
 
@@ -1275,19 +1297,29 @@ function BroadcasterPage() {
   }
 
   useEffect(() => {
-    const initialRefresh = window.setTimeout(() => { void refreshCameras() }, 0)
-    // Try to start the live preview right away (will silently fail if no permission yet).
-    const initialPreview = window.setTimeout(() => { void acquirePreview() }, 100)
     const resume = readResumeSession()
-    if (resume && resume.roomId && !autoResumeAttemptedRef.current) {
+    const hasResume = !!(resume && resume.roomId)
+    const initialRefresh = window.setTimeout(() => { void refreshCameras() }, 0)
+    // Only auto-open the preview when we're NOT about to auto-resume. The
+    // resume path calls startBroadcast(), which opens the camera itself, and
+    // having two getUserMedia calls in flight at once on Android causes the
+    // second one to receive the wrong camera (or hang) — the OS can only
+    // hold one camera open at a time.
+    const initialPreview = hasResume
+      ? null
+      : window.setTimeout(() => { void acquirePreview() }, 100)
+    if (hasResume && !autoResumeAttemptedRef.current) {
       autoResumeAttemptedRef.current = true
-      window.setTimeout(() => {
+      // Defer until after refreshCameras has had a chance to populate the
+      // list, so resolveCameraEntry maps the saved cameraId correctly.
+      ;(async () => {
+        try { await refreshCameras() } catch { /* noop */ }
         startBroadcastRef.current({
           roomId: resume.roomId,
           title: resume.title || '',
           cameraId: resume.cameraId || '',
         })
-      }, 600)
+      })()
     }
     const onDeviceChange = () => { void refreshCameras() }
     navigator.mediaDevices?.addEventListener('devicechange', onDeviceChange)
@@ -1979,7 +2011,12 @@ function ViewerPage() {
 
       peer.on('open', () => {
         if (cancelled || ended) return
-        const conn = peer.connect(roomId, { reliable: true })
+        const conn = peer.connect(roomId, {
+          reliable: true,
+          // Tag admin viewers so the broadcaster includes them in capability
+          // push updates (camera list changes, hot-plugged USB cams, etc.).
+          metadata: isAdminMode ? { kind: 'admin-watch' } : undefined,
+        })
         activeConn = conn
         connRef.current = conn
 
@@ -2315,6 +2352,7 @@ function PreviewVideo({ stream }) {
 
 function DraggablePanel({ className = '', storageKey, children }) {
   const wrapRef = useRef(null)
+  const placeholderRef = useRef(null)
   const [pos, setPos] = useState(() => {
     if (!storageKey) return null
     try {
@@ -2326,6 +2364,19 @@ function DraggablePanel({ className = '', storageKey, children }) {
     return null
   })
   const dragRef = useRef(null)
+
+  // If no saved position, compute the initial on-screen position from the
+  // inline placeholder so the portalled panel visually starts where the
+  // parent layout intended.
+  useEffect(() => {
+    if (pos) return
+    const ph = placeholderRef.current
+    const wrap = wrapRef.current
+    if (!ph || !wrap) return
+    const rect = ph.getBoundingClientRect()
+    if (rect.width === 0 && rect.height === 0) return
+    setPos({ x: rect.left, y: rect.top })
+  }, [pos])
 
   useEffect(() => {
     const wrap = wrapRef.current
@@ -2412,12 +2463,24 @@ function DraggablePanel({ className = '', storageKey, children }) {
 
   const style = pos
     ? { position: 'fixed', left: `${pos.x}px`, top: `${pos.y}px`, right: 'auto', bottom: 'auto', margin: 0, zIndex: 60 }
-    : undefined
+    : { position: 'fixed', visibility: 'hidden', zIndex: 60 }
 
-  return (
+  const node = (
     <div ref={wrapRef} className={`${className} draggablePanel${pos ? ' isDragged' : ''}`} style={style}>
       {children}
     </div>
+  )
+  // Always portal the panel to <body>. This guarantees `position: fixed`
+  // uses true viewport coordinates regardless of any ancestor having a
+  // CSS `transform` (which would otherwise create a containing block and
+  // break drag math). The inline placeholder reserves layout space at the
+  // intended natural location so we can seed the initial position.
+  if (typeof document === 'undefined') return node
+  return (
+    <>
+      <div ref={placeholderRef} className={`${className} draggablePanelPlaceholder`} aria-hidden="true" style={{ visibility: 'hidden', pointerEvents: 'none' }} />
+      {createPortal(node, document.body)}
+    </>
   )
 }
 
