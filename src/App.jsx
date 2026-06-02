@@ -101,58 +101,113 @@ function classifyCamera(device, allDevices) {
   return { isUsb: false, isBuiltIn: false }
 }
 
-async function acquireStream(deviceId) {
+// Detect which way a camera faces from its label. Many Android browsers expose
+// labels like "camera2 0, facing back" or "Back Camera"; iOS uses "Back" /
+// "Front"; Samsung often uses "Rear" / "Front". Returns 'environment', 'user',
+// or null when undetectable.
+const FACING_BACK_RE = /\b(back|rear|environment|world|outward|exterior|trase|arri[eè]re|hinten|au[sß]en|zad|задн)/i
+const FACING_FRONT_RE = /\b(front|user|self|selfie|face[\s-]?time|inward|interior|frontal|vorn|перед)/i
+function detectFacing(label) {
+  if (!label) return null
+  if (FACING_BACK_RE.test(label)) return 'environment'
+  if (FACING_FRONT_RE.test(label)) return 'user'
+  return null
+}
+
+const IS_MOBILE_UA = /Android|iPhone|iPad|iPod/i
+
+// Build the ordered list of MediaTrackConstraints attempts for a given camera
+// entry. Crucially: when a facing direction is known/requested, we NEVER fall
+// back to the opposite facing — otherwise selecting "Back camera" silently
+// flips to the front camera on phones (e.g. Samsung tabs whose secondary back
+// lens deviceIds can't actually open a stream).
+function buildVideoAttempts(camera) {
+  const attempts = []
+  const facing = camera?.facing || null
+  const ids = camera?.candidateIds && camera.candidateIds.length
+    ? camera.candidateIds
+    : camera?.deviceId ? [camera.deviceId] : []
+
+  if (facing) {
+    // `exact` will throw OverconstrainedError rather than picking the other
+    // camera — exactly what we want here.
+    attempts.push({
+      facingMode: { exact: facing },
+      width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30, max: 30 },
+    })
+    attempts.push({ facingMode: { exact: facing }, width: { ideal: 640 }, height: { ideal: 480 } })
+    attempts.push({ facingMode: { exact: facing } })
+  }
+
+  for (const id of ids) {
+    const base = facing ? { facingMode: { ideal: facing } } : {}
+    attempts.push({
+      ...base, deviceId: { exact: id },
+      width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30, max: 30 },
+    })
+    attempts.push({
+      ...base, deviceId: { exact: id },
+      width: { ideal: 640 }, height: { ideal: 480 },
+    })
+    attempts.push({ ...base, deviceId: { exact: id } })
+  }
+
+  if (!facing) {
+    attempts.push({ width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30, max: 30 } })
+    attempts.push({ width: { ideal: 640 }, height: { ideal: 480 } })
+    attempts.push(true)
+  }
+
+  return attempts
+}
+
+async function acquireStream(camera) {
   const audio = {
     echoCancellation: true,
     noiseSuppression: true,
     autoGainControl: true,
   }
-  const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent || '')
-  const videoAttempts = []
-  // On mobile, deviceId from a previous session is often stale after reload
-  // (Android randomizes per-session ids until permission is granted). Prefer
-  // facingMode-based attempts FIRST so we always get *some* camera, then fall
-  // back to the saved deviceId if it still exists.
-  if (isMobile) {
-    videoAttempts.push({
-      facingMode: { ideal: 'environment' },
-      width: { ideal: 1280 }, height: { ideal: 720 },
-    })
-    videoAttempts.push({ facingMode: 'environment' })
-    videoAttempts.push({ facingMode: 'user' })
-  }
-  if (deviceId) {
-    videoAttempts.push({
-      deviceId: { exact: deviceId },
-      width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30, max: 30 },
-    })
-    videoAttempts.push({
-      deviceId: { exact: deviceId },
-      width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 24, max: 30 },
-    })
-    videoAttempts.push({ deviceId: { exact: deviceId } })
-    videoAttempts.push({ deviceId })
-  }
-  videoAttempts.push({ width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30, max: 30 } })
-  videoAttempts.push({ width: { ideal: 640 }, height: { ideal: 480 } })
-  videoAttempts.push(true)
+  const facing = camera?.facing || null
+  const videoAttempts = buildVideoAttempts(camera)
 
   let lastError = null
   for (const video of videoAttempts) {
     try {
-      return await navigator.mediaDevices.getUserMedia({ video, audio })
+      const stream = await navigator.mediaDevices.getUserMedia({ video, audio })
+      // Verify we actually got the requested facing. Some Android browsers
+      // ignore deviceId constraints and hand back the default (front) camera.
+      if (facing) {
+        const track = stream.getVideoTracks()[0]
+        const settings = track?.getSettings?.() || {}
+        const got = settings.facingMode
+        if (got && got !== facing) {
+          stream.getTracks().forEach((t) => t.stop())
+          continue
+        }
+      }
+      return stream
     } catch (err) {
       lastError = err
-      // If the user denied permission, no point trying other constraints.
       if (err && (err.name === 'NotAllowedError' || err.name === 'SecurityError')) {
         break
       }
     }
   }
-  // Last resort: video-only (some Android browsers reject combined access).
+
+  // Audio sometimes blocks the open on Android Chrome; retry video-only,
+  // still respecting the requested facing if one was specified.
   if (!lastError || (lastError.name !== 'NotAllowedError' && lastError.name !== 'SecurityError')) {
+    const fallback = facing ? { facingMode: { ideal: facing } } : true
     try {
-      return await navigator.mediaDevices.getUserMedia({ video: true })
+      const stream = await navigator.mediaDevices.getUserMedia({ video: fallback })
+      if (facing) {
+        const got = stream.getVideoTracks()[0]?.getSettings?.().facingMode
+        if (got && got !== facing) {
+          stream.getTracks().forEach((t) => t.stop())
+          throw new Error(`Requested ${facing} camera but received ${got}`)
+        }
+      }
+      return stream
     } catch (err) {
       lastError = err
     }
@@ -238,6 +293,7 @@ function BroadcasterPage() {
   const peerRef = useRef(null)
   const streamRef = useRef(null)
   const previewStreamRef = useRef(null)
+  const camerasRef = useRef([])
   const rawVideoTrackRef = useRef(null)
   const softwareSettingsRef = useRef({ ...DEFAULT_SOFTWARE_SETTINGS })
   const swProcRef = useRef(null)
@@ -275,21 +331,94 @@ function BroadcasterPage() {
   const refreshCameras = useCallback(async () => {
     if (!navigator.mediaDevices?.enumerateDevices) return
     const devices = await navigator.mediaDevices.enumerateDevices()
-    const cameraDevices = devices
-      .filter((d) => d.kind === 'videoinput')
-      .map((device, index) => {
-        const { isUsb, isBuiltIn } = classifyCamera(device, devices)
+    const videoInputs = devices.filter((d) => d.kind === 'videoinput')
+    const isMobile = IS_MOBILE_UA.test(navigator.userAgent || '')
+
+    let entries
+    if (isMobile) {
+      // Android/iOS commonly enumerate every physical lens (main / wide /
+      // ultrawide / macro / telephoto) as a separate device — but on many
+      // phones (e.g. Samsung S10 Lite Tab) only the default lens per facing
+      // can actually stream. Collapse them into one logical option per
+      // facing direction so the user picks "Back" vs "Front", and we keep
+      // every underlying deviceId as a fallback candidate.
+      const buckets = { environment: [], user: [], unknown: [] }
+      videoInputs.forEach((d) => {
+        const f = detectFacing(d.label)
+        if (f) buckets[f].push(d)
+        else buckets.unknown.push(d)
+      })
+      const labelsKnown = buckets.environment.length > 0 || buckets.user.length > 0
+
+      if (!labelsKnown) {
+        // No permission yet → no labels → can't group safely. Show one
+        // generic entry so the user can grant permission; refreshCameras
+        // will run again afterwards and group properly.
+        entries = videoInputs.map((d, index) => ({
+          deviceId: d.deviceId,
+          candidateIds: [d.deviceId],
+          label: d.label || (videoInputs.length === 1 ? 'Camera' : `Camera ${index + 1}`),
+          facing: null,
+          isUsb: false, isBuiltIn: true,
+        }))
+      } else {
+        entries = []
+        if (buckets.environment.length) {
+          entries.push({
+            deviceId: buckets.environment[0].deviceId,
+            candidateIds: buckets.environment.map((d) => d.deviceId),
+            label: 'Back camera',
+            facing: 'environment',
+            isUsb: false, isBuiltIn: true,
+          })
+        }
+        if (buckets.user.length) {
+          entries.push({
+            deviceId: buckets.user[0].deviceId,
+            candidateIds: buckets.user.map((d) => d.deviceId),
+            label: 'Front camera',
+            facing: 'user',
+            isUsb: false, isBuiltIn: true,
+          })
+        }
+        buckets.unknown.forEach((d, i) => {
+          entries.push({
+            deviceId: d.deviceId,
+            candidateIds: [d.deviceId],
+            label: d.label || `Camera ${entries.length + 1 + i}`,
+            facing: null,
+            isUsb: false, isBuiltIn: true,
+          })
+        })
+      }
+    } else {
+      entries = videoInputs.map((d, index) => {
+        const { isUsb, isBuiltIn } = classifyCamera(d, devices)
         return {
-          deviceId: device.deviceId,
-          label: device.label || `Camera ${index + 1}`,
+          deviceId: d.deviceId,
+          candidateIds: [d.deviceId],
+          label: d.label || `Camera ${index + 1}`,
+          facing: detectFacing(d.label),
           isUsb, isBuiltIn,
         }
       })
-    setCameras(cameraDevices)
+    }
+
+    camerasRef.current = entries
+    setCameras(entries)
     setSelectedCameraId((current) => {
-      if (current && cameraDevices.some((c) => c.deviceId === current)) return current
-      const usb = cameraDevices.find((c) => c.isUsb)
-      return usb?.deviceId || cameraDevices[0]?.deviceId || ''
+      if (current) {
+        const match = entries.find(
+          (c) => c.deviceId === current || c.candidateIds.includes(current)
+        )
+        if (match) return match.deviceId
+      }
+      if (isMobile) {
+        const back = entries.find((c) => c.facing === 'environment')
+        if (back) return back.deviceId
+      }
+      const usb = entries.find((c) => c.isUsb)
+      return usb?.deviceId || entries[0]?.deviceId || ''
     })
   }, [])
 
@@ -311,16 +440,29 @@ function BroadcasterPage() {
     setHasPreview(false)
   }, [])
 
+  const resolveCameraEntry = useCallback((id) => {
+    const list = camerasRef.current || []
+    if (!id) return list[0] || null
+    return (
+      list.find((c) => c.deviceId === id || c.candidateIds?.includes(id)) ||
+      list[0] || null
+    )
+  }, [])
+
   const acquirePreview = useCallback(async (deviceId) => {
     // Don't disturb a live broadcast — it owns the camera while live.
     if (statusRef.current === 'live' || statusRef.current === 'starting') return
     try {
-      const target = deviceId || selectedCameraId
+      const targetId = deviceId || selectedCameraId
+      const camera = resolveCameraEntry(targetId)
       const existing = previewStreamRef.current
       if (existing) {
         const track = existing.getVideoTracks()[0]
         const currentId = track?.getSettings?.().deviceId
-        if (track && (!target || currentId === target)) {
+        const currentMatches = camera
+          ? (camera.deviceId === currentId || camera.candidateIds?.includes(currentId))
+          : (!targetId || currentId === targetId)
+        if (track && currentMatches) {
           if (previewRef.current && previewRef.current.srcObject !== existing) {
             previewRef.current.srcObject = existing
           }
@@ -329,25 +471,27 @@ function BroadcasterPage() {
         }
         stopPreviewStream()
       }
-      const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent || '')
-      const attempts = []
-      if (target) {
-        attempts.push({ video: { deviceId: { exact: target } }, audio: false })
-        attempts.push({ video: { deviceId: target }, audio: false })
-      }
-      if (isMobile) {
-        attempts.push({ video: { facingMode: { ideal: 'environment' } }, audio: false })
-        attempts.push({ video: { facingMode: 'environment' }, audio: false })
-        attempts.push({ video: { facingMode: 'user' }, audio: false })
-      }
-      attempts.push({ video: { width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false })
-      attempts.push({ video: true, audio: false })
 
+      // Reuse the same constraint ladder as live capture so behavior is
+      // identical for preview vs broadcast (including no opposite-facing
+      // fallback).
+      const videoAttempts = buildVideoAttempts(camera || (targetId ? { candidateIds: [targetId] } : null))
+      const facing = camera?.facing || null
       let next = null
       let lastErr = null
-      for (const c of attempts) {
-        try { next = await navigator.mediaDevices.getUserMedia(c); break }
-        catch (err) {
+      for (const v of videoAttempts) {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ video: v, audio: false })
+          if (facing) {
+            const got = stream.getVideoTracks()[0]?.getSettings?.().facingMode
+            if (got && got !== facing) {
+              stream.getTracks().forEach((t) => t.stop())
+              continue
+            }
+          }
+          next = stream
+          break
+        } catch (err) {
           lastErr = err
           if (err && (err.name === 'NotAllowedError' || err.name === 'SecurityError')) break
         }
@@ -364,7 +508,10 @@ function BroadcasterPage() {
       const track = next.getVideoTracks()[0]
       if (track?.getSettings) {
         const s = track.getSettings()
-        if (s.deviceId) setSelectedCameraId(s.deviceId)
+        // Keep selection sticky to the grouped entry's representative id so
+        // the <select> stays aligned with what is actually playing.
+        if (camera) setSelectedCameraId(camera.deviceId)
+        else if (s.deviceId) setSelectedCameraId(s.deviceId)
       }
       // Refresh labels in case this was the first permission grant.
       await refreshCameras()
@@ -372,9 +519,11 @@ function BroadcasterPage() {
       setHasPreview(false)
       if (err && (err.name === 'NotAllowedError' || err.name === 'SecurityError')) {
         setError('Camera permission was denied. Tap "Enable camera" to retry.')
+      } else if (err && err.name === 'OverconstrainedError') {
+        setError('Selected camera could not be opened. Try the other camera or tap refresh.')
       }
     }
-  }, [selectedCameraId, refreshCameras, stopPreviewStream])
+  }, [selectedCameraId, refreshCameras, stopPreviewStream, resolveCameraEntry])
 
   const releaseWakeLock = useCallback(async () => {
     if (!wakeLockRef.current) return
@@ -646,7 +795,8 @@ function BroadcasterPage() {
     }
 
     try {
-      const localStream = await acquireStream(desiredCameraId)
+      const cameraEntry = resolveCameraEntry(desiredCameraId)
+      const localStream = await acquireStream(cameraEntry)
       streamRef.current = localStream
       rawVideoTrackRef.current = localStream.getVideoTracks()[0] || null
       // Reset software pipeline to defaults on fresh capture
@@ -869,7 +1019,7 @@ function BroadcasterPage() {
       setStatus('idle')
     }
   }, [
-    streamTitle, selectedCameraId, refreshCameras,
+    streamTitle, selectedCameraId, refreshCameras, resolveCameraEntry,
     requestWakeLock, connectAdminPresence, closeAdminPresence, sendPresence,
   ])
 
@@ -1004,10 +1154,15 @@ function BroadcasterPage() {
     if (!selectedCameraId) return
     if (statusRef.current === 'live') {
       const currentLive = streamRef.current?.getVideoTracks?.()[0]?.getSettings?.().deviceId
-      if (currentLive === selectedCameraId) return
+      const cameraEntry = resolveCameraEntry(selectedCameraId)
+      if (
+        currentLive &&
+        cameraEntry &&
+        (cameraEntry.deviceId === currentLive || cameraEntry.candidateIds?.includes(currentLive))
+      ) return
       ;(async () => {
         try {
-          const newStream = await acquireStream(selectedCameraId)
+          const newStream = await acquireStream(cameraEntry)
           const newTrack = newStream.getVideoTracks()[0]
           if (!newTrack) { newStream.getTracks().forEach((t) => t.stop()); return }
           // Discard newly acquired audio — keep the original mic.
@@ -1032,9 +1187,14 @@ function BroadcasterPage() {
       return
     }
     const current = previewStreamRef.current?.getVideoTracks?.()[0]?.getSettings?.().deviceId
-    if (current === selectedCameraId) return
+    const cameraEntry = resolveCameraEntry(selectedCameraId)
+    if (
+      current &&
+      cameraEntry &&
+      (cameraEntry.deviceId === current || cameraEntry.candidateIds?.includes(current))
+    ) return
     void acquirePreview(selectedCameraId)
-  }, [selectedCameraId, acquirePreview, replaceVideoTrackOnCalls, teardownSoftwareProcessor])
+  }, [selectedCameraId, acquirePreview, replaceVideoTrackOnCalls, teardownSoftwareProcessor, resolveCameraEntry])
 
   const isLive = status === 'live'
   const isStarting = status === 'starting'
@@ -1152,7 +1312,7 @@ function BroadcasterPage() {
                   {cameras.length === 0 && <option value="">No camera detected</option>}
                   {cameras.map((c) => (
                     <option key={c.deviceId} value={c.deviceId}>
-                      {c.label}{c.isUsb ? ' — USB' : c.isBuiltIn ? ' — Built-in' : ''}
+                      {c.label}{c.isUsb ? ' — USB' : (c.isBuiltIn && !c.facing) ? ' — Built-in' : ''}
                     </option>
                   ))}
                 </select>
