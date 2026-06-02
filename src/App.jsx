@@ -134,11 +134,8 @@ function readTrackFacing(track) {
 }
 
 // One-time probe to learn which physical deviceId corresponds to each facing.
-// On Android (especially Samsung tablets) enumerateDevices() returns multiple
-// "back" lens entries, only one of which actually streams; the labels are
-// often opaque ("camera2 0"). The only reliable way to map facing -> deviceId
-// is to ask the browser, then inspect what it gave us. Each probe runs
-// sequentially because Android browsers can't hold two cameras open at once.
+// NOTE: Intentionally unused on the hot path — see comment in refreshCameras.
+// Kept as an opt-in helper for desktop diagnostics if ever needed.
 async function probeCameraFacings() {
   const results = { environment: null, user: null }
   for (const facing of ['environment', 'user']) {
@@ -149,12 +146,11 @@ async function probeCameraFacings() {
       })
       const track = stream.getVideoTracks()[0]
       const settings = (track && track.getSettings?.()) || {}
-      const observedFacing = readTrackFacing(track)
       results[facing] = {
         deviceId: settings.deviceId || null,
         groupId: settings.groupId || null,
         label: (track && track.label) || '',
-        observedFacing,
+        observedFacing: readTrackFacing(track),
       }
     } catch { /* probe failed: this facing isn't available */ }
     if (stream) {
@@ -167,25 +163,32 @@ async function probeCameraFacings() {
 const IS_MOBILE_UA = /Android|iPhone|iPad|iPod/i
 
 // Build the ordered list of MediaTrackConstraints attempts for a given camera
-// entry. Crucially: when a facing direction is known/requested, we NEVER fall
-// back to the opposite facing — otherwise selecting "Back camera" silently
-// flips to the front camera on phones (e.g. Samsung tabs whose secondary back
-// lens deviceIds can't actually open a stream).
+// entry. On mobile we always go through the facingMode path first because
+// it is the most universally supported way to pick back vs front in mobile
+// browsers (per webrtcHacks/adapter#820 and MDN). DeviceId pinning is only
+// a fallback for desktop / USB cameras.
 function buildVideoAttempts(camera) {
   const attempts = []
   const facing = camera?.facing || null
   const ids = camera?.candidateIds && camera.candidateIds.length
     ? camera.candidateIds
-    : camera?.deviceId ? [camera.deviceId] : []
+    : camera?.deviceId && !String(camera.deviceId).startsWith('facing:')
+      ? [camera.deviceId]
+      : []
 
   if (facing) {
-    // `exact` will throw OverconstrainedError rather than picking the other
-    // camera — exactly what we want here.
+    // Plain (ConstrainDOMString) form first — most compatible across
+    // Android Chromium versions. The browser MUST honor a single string value
+    // per spec when a matching facing exists, and it does not throw on most
+    // builds the way `{exact: ...}` does.
     attempts.push({
-      facingMode: { exact: facing },
+      facingMode: facing,
       width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30, max: 30 },
     })
-    attempts.push({ facingMode: { exact: facing }, width: { ideal: 640 }, height: { ideal: 480 } })
+    attempts.push({ facingMode: facing, width: { ideal: 640 }, height: { ideal: 480 } })
+    attempts.push({ facingMode: facing })
+    // Strict form last: throws OverconstrainedError on devices that lack
+    // the requested camera, which is the right outcome at this point.
     attempts.push({ facingMode: { exact: facing } })
   }
 
@@ -295,7 +298,7 @@ const CONTROLLABLE_KEYS = [
   'colorTemperature', 'whiteBalanceMode', 'focusMode', 'exposureMode', 'torch',
 ]
 
-function snapshotCameraCapabilities(track, software) {
+function snapshotCameraCapabilities(track, software, cameraInfo) {
   const hw = {}
   if (track && typeof track.getCapabilities === 'function') {
     let caps = {}
@@ -309,6 +312,8 @@ function snapshotCameraCapabilities(track, software) {
   return {
     hardware: Object.keys(hw).length ? hw : null,
     software: software || { ...DEFAULT_SOFTWARE_SETTINGS },
+    cameras: cameraInfo?.cameras || [],
+    currentCameraId: cameraInfo?.currentCameraId || null,
   }
 }
 
@@ -346,8 +351,6 @@ function BroadcasterPage() {
   const streamRef = useRef(null)
   const previewStreamRef = useRef(null)
   const camerasRef = useRef([])
-  const facingProbeRef = useRef(null)
-  const facingProbePromiseRef = useRef(null)
   const rawVideoTrackRef = useRef(null)
   const softwareSettingsRef = useRef({ ...DEFAULT_SOFTWARE_SETTINGS })
   const swProcRef = useRef(null)
@@ -376,6 +379,16 @@ function BroadcasterPage() {
   const [hasPreview, setHasPreview] = useState(false)
 
   useEffect(() => { statusRef.current = status }, [status])
+  const selectedCameraIdRef = useRef('')
+  useEffect(() => { selectedCameraIdRef.current = selectedCameraId }, [selectedCameraId])
+  // Notify admin watchers whenever the camera list or selected camera
+  // changes so the remote camera-switcher UI stays in sync. Guarded by a
+  // ref existence check so it's a no-op when not broadcasting yet.
+  const broadcastCapabilitiesRef = useRef(null)
+  useEffect(() => {
+    const fn = broadcastCapabilitiesRef.current
+    if (fn) fn()
+  }, [cameras, selectedCameraId])
 
   const shareUrl = useMemo(() => {
     if (!roomId) return ''
@@ -388,106 +401,126 @@ function BroadcasterPage() {
     const videoInputs = devices.filter((d) => d.kind === 'videoinput')
     const isMobile = IS_MOBILE_UA.test(navigator.userAgent || '')
 
-    let entries
-    if (isMobile) {
-      // We can only group reliably once labels are populated (which requires
-      // permission). Without permission, emit one generic entry per device so
-      // the user can grant permission; a follow-up refresh after permission
-      // will replace this list with proper Back/Front entries.
-      const anyLabel = videoInputs.some((d) => d.label)
-      if (!anyLabel) {
-        entries = videoInputs.map((d, index) => ({
+    // External / USB webcams (DroidCam, UVC) plugged into Android tablets
+    // show up in enumerateDevices like any other camera, but their labels
+    // don't match the back/front pattern. Detect them up front so we can
+    // expose them as their own entries on both mobile and desktop.
+    const usbEntries = []
+    videoInputs.forEach((d, index) => {
+      const { isUsb } = classifyCamera(d, devices)
+      const labelFacing = detectFacing(d.label)
+      // Treat as USB only if it's classified as USB AND its label doesn't
+      // shout "front/back" — otherwise the built-in cams on phones that
+      // happen to match a USB hint (rare) would be duplicated.
+      if (isUsb && !labelFacing) {
+        usbEntries.push({
           deviceId: d.deviceId,
           candidateIds: [d.deviceId],
-          label: d.label || (videoInputs.length === 1 ? 'Camera' : `Camera ${index + 1}`),
+          label: d.label || `USB camera ${index + 1}`,
+          facing: null,
+          isUsb: true, isBuiltIn: false,
+        })
+      }
+    })
+
+    let entries
+    if (isMobile) {
+      const anyLabel = videoInputs.some((d) => d.label)
+      const builtInInputs = videoInputs.filter((d) => {
+        const { isUsb } = classifyCamera(d, devices)
+        const labelFacing = detectFacing(d.label)
+        return !(isUsb && !labelFacing)
+      })
+      if (videoInputs.length === 0) {
+        entries = []
+      } else if (builtInInputs.length === 1 && usbEntries.length === 0) {
+        // Single-camera tab/phone. Don't pretend a back camera exists.
+        const d = builtInInputs[0]
+        const f = detectFacing(d.label)
+        entries = [{
+          deviceId: d.deviceId || 'cam:0',
+          candidateIds: d.deviceId ? [d.deviceId] : [],
+          label: d.label || 'Camera',
+          facing: f,
+          isUsb: false, isBuiltIn: true,
+        }]
+      } else if (!anyLabel) {
+        // Pre-permission: enumerateDevices returns devices without labels.
+        // We can't reliably distinguish back from front yet, so present a
+        // single "Camera" entry that will request permission. After grant,
+        // refreshCameras() runs again with labels available.
+        entries = [{
+          deviceId: 'cam:permission',
+          candidateIds: [],
+          label: 'Camera (tap to enable)',
           facing: null,
           isUsb: false, isBuiltIn: true,
-        }))
+        }]
       } else {
-        // Reuse a cached probe if we have one; otherwise probe (serialized so
-        // concurrent refreshes share the same probe).
-        if (!facingProbeRef.current && !facingProbePromiseRef.current) {
-          facingProbePromiseRef.current = probeCameraFacings()
-            .then((r) => { facingProbeRef.current = r; return r })
-            .catch(() => { facingProbeRef.current = { environment: null, user: null }; return facingProbeRef.current })
-            .finally(() => { facingProbePromiseRef.current = null })
-        }
-        if (facingProbePromiseRef.current) {
-          await facingProbePromiseRef.current
-          // Devices list may have new labels now — re-enumerate.
-          const fresh = await navigator.mediaDevices.enumerateDevices()
-          videoInputs.length = 0
-          fresh.filter((d) => d.kind === 'videoinput').forEach((d) => videoInputs.push(d))
-        }
-        const probe = facingProbeRef.current || { environment: null, user: null }
-
-        // Bucket every enumerated device by facing using BOTH the probe result
-        // (authoritative) and the label heuristic (covers the case where the
-        // probe could not run, e.g. only one facing exists).
-        const back = []
-        const front = []
-        const unknown = []
-        videoInputs.forEach((d) => {
-          const labelFacing = detectFacing(d.label)
-          const matchesBackProbe = probe.environment && (
-            probe.environment.deviceId === d.deviceId ||
-            (probe.environment.groupId && probe.environment.groupId === d.groupId)
-          )
-          const matchesFrontProbe = probe.user && (
-            probe.user.deviceId === d.deviceId ||
-            (probe.user.groupId && probe.user.groupId === d.groupId)
-          )
-          if (matchesBackProbe || labelFacing === 'environment') back.push(d)
-          else if (matchesFrontProbe || labelFacing === 'user') front.push(d)
-          else unknown.push(d)
-        })
-
-        // Use probe deviceIds first — those are guaranteed to actually open as
-        // the requested facing. Other matching deviceIds become fallbacks.
-        const buildEntry = (probed, bucket, facing, label) => {
-          if (!probed && bucket.length === 0) return null
-          const primaryId = probed?.deviceId || bucket[0].deviceId
-          const ids = []
-          if (primaryId) ids.push(primaryId)
-          bucket.forEach((d) => {
-            if (d.deviceId && !ids.includes(d.deviceId)) ids.push(d.deviceId)
-          })
-          return {
-            deviceId: primaryId,
-            candidateIds: ids,
-            label,
-            facing,
-            isUsb: false, isBuiltIn: true,
-          }
-        }
-
+        // Permission granted, multiple video inputs. On Samsung/Android the
+        // labels are often opaque ("camera2 0") so we DO NOT try to group by
+        // deviceId. Instead we expose two logical entries (Back + Front)
+        // that open exclusively via facingMode — the only mechanism that
+        // works reliably across mobile Chromium versions (see webrtcHacks
+        // adapter #820). The exact physical lens is left to the OS.
+        const hasBackLabel = builtInInputs.some((d) => detectFacing(d.label) === 'environment')
+        const hasFrontLabel = builtInInputs.some((d) => detectFacing(d.label) === 'user')
+        // If labels gave us BOTH facings, trust them. If labels were opaque
+        // for some, assume a typical front+back layout (every modern phone /
+        // tablet with >=2 video inputs has at least one of each).
+        const hasMultipleBuiltIn = builtInInputs.length >= 2
+        const showBack = hasBackLabel || (hasMultipleBuiltIn && !hasFrontLabel && !hasBackLabel)
+        const showFront = hasFrontLabel || (hasMultipleBuiltIn && !hasFrontLabel && !hasBackLabel)
         entries = []
-        const backEntry = buildEntry(probe.environment, back, 'environment', 'Back camera')
-        if (backEntry) entries.push(backEntry)
-        const frontEntry = buildEntry(probe.user, front, 'user', 'Front camera')
-        if (frontEntry) entries.push(frontEntry)
-        unknown.forEach((d, i) => {
+        if (showBack) entries.push({
+          deviceId: 'facing:environment',
+          candidateIds: [],
+          label: 'Back camera',
+          facing: 'environment',
+          isUsb: false, isBuiltIn: true,
+        })
+        if (showFront) entries.push({
+          deviceId: 'facing:user',
+          candidateIds: [],
+          label: 'Front camera',
+          facing: 'user',
+          isUsb: false, isBuiltIn: true,
+        })
+        // Edge case: labels said only "back" exists on a multi-input device.
+        // Still surface a Front entry so the user isn't locked out.
+        if (hasMultipleBuiltIn && hasBackLabel && !hasFrontLabel && !showFront) {
           entries.push({
-            deviceId: d.deviceId,
-            candidateIds: [d.deviceId],
-            label: d.label || `Camera ${entries.length + 1 + i}`,
-            facing: null,
+            deviceId: 'facing:user',
+            candidateIds: [],
+            label: 'Front camera',
+            facing: 'user',
             isUsb: false, isBuiltIn: true,
           })
-        })
-
-        // Final safety net: if neither facing was identified (probe failed AND
-        // labels were uninformative) just expose every device individually.
-        if (entries.length === 0) {
-          entries = videoInputs.map((d, index) => ({
-            deviceId: d.deviceId,
-            candidateIds: [d.deviceId],
-            label: d.label || `Camera ${index + 1}`,
-            facing: null,
+        }
+        if (hasMultipleBuiltIn && hasFrontLabel && !hasBackLabel && !showBack) {
+          entries.unshift({
+            deviceId: 'facing:environment',
+            candidateIds: [],
+            label: 'Back camera',
+            facing: 'environment',
             isUsb: false, isBuiltIn: true,
-          }))
+          })
+        }
+        // Single built-in + at least one USB: also surface the built-in so
+        // the user can switch between USB and the phone's native cam.
+        if (entries.length === 0 && builtInInputs.length === 1) {
+          const d = builtInInputs[0]
+          entries.push({
+            deviceId: d.deviceId || 'cam:0',
+            candidateIds: d.deviceId ? [d.deviceId] : [],
+            label: d.label || 'Built-in camera',
+            facing: detectFacing(d.label),
+            isUsb: false, isBuiltIn: true,
+          })
         }
       }
+      // Append USB webcams as their own switchable entries.
+      entries.push(...usbEntries)
     } else {
       entries = videoInputs.map((d, index) => {
         const { isUsb, isBuiltIn } = classifyCamera(d, devices)
@@ -509,6 +542,8 @@ function BroadcasterPage() {
           (c) => c.deviceId === current || c.candidateIds.includes(current)
         )
         if (match) return match.deviceId
+        // Migrate a previously-saved real deviceId into a facing entry on mobile.
+        if (isMobile && entries.length) return entries[0].deviceId
       }
       if (isMobile) {
         const back = entries.find((c) => c.facing === 'environment')
@@ -525,11 +560,6 @@ function BroadcasterPage() {
       const probe = await navigator.mediaDevices.getUserMedia({ video: true, audio: false })
       probe.getTracks().forEach((t) => t.stop())
     } catch { /* noop */ }
-    // Force a fresh facing probe — useful if the user just plugged in or
-    // toggled a camera, or if the prior probe ran before permission was
-    // granted and so could not identify both facings.
-    facingProbeRef.current = null
-    facingProbePromiseRef.current = null
     await refreshCameras()
   }, [refreshCameras])
 
@@ -560,10 +590,17 @@ function BroadcasterPage() {
       const existing = previewStreamRef.current
       if (existing) {
         const track = existing.getVideoTracks()[0]
-        const currentId = track?.getSettings?.().deviceId
-        const currentMatches = camera
-          ? (camera.deviceId === currentId || camera.candidateIds?.includes(currentId))
-          : (!targetId || currentId === targetId)
+        const settings = track?.getSettings?.() || {}
+        let currentMatches
+        if (camera?.facing && (!camera.candidateIds || camera.candidateIds.length === 0)) {
+          // Mobile facing-only entry: match by track facing direction.
+          currentMatches = !!track && readTrackFacing(track) === camera.facing
+        } else if (camera) {
+          currentMatches = camera.deviceId === settings.deviceId
+            || camera.candidateIds?.includes(settings.deviceId)
+        } else {
+          currentMatches = !targetId || settings.deviceId === targetId
+        }
         if (track && currentMatches) {
           if (previewRef.current && previewRef.current.srcObject !== existing) {
             previewRef.current.srcObject = existing
@@ -571,21 +608,27 @@ function BroadcasterPage() {
           setHasPreview(true)
           return
         }
+        // CRITICAL: stop the previous stream BEFORE trying to acquire a new
+        // one. On Android/iOS the browser can only hold one camera open at a
+        // time; calling getUserMedia while another camera track is alive
+        // commonly returns the *same* (wrong) camera. Synchronously stop
+        // every track and clear srcObject before awaiting the new one.
         stopPreviewStream()
       }
 
       // Reuse the same constraint ladder as live capture so behavior is
       // identical for preview vs broadcast (including no opposite-facing
       // fallback).
-      const videoAttempts = buildVideoAttempts(camera || (targetId ? { candidateIds: [targetId] } : null))
+      const videoAttempts = buildVideoAttempts(camera || (targetId && !String(targetId).startsWith('facing:') && !String(targetId).startsWith('cam:') ? { candidateIds: [targetId] } : null))
       const facing = camera?.facing || null
       let next = null
       let lastErr = null
       for (const v of videoAttempts) {
+        let stream = null
         try {
-          const stream = await navigator.mediaDevices.getUserMedia({ video: v, audio: false })
+          stream = await navigator.mediaDevices.getUserMedia({ video: v, audio: false })
           if (facing) {
-            const got = stream.getVideoTracks()[0]?.getSettings?.().facingMode
+            const got = readTrackFacing(stream.getVideoTracks()[0])
             if (got && got !== facing) {
               stream.getTracks().forEach((t) => t.stop())
               continue
@@ -594,6 +637,7 @@ function BroadcasterPage() {
           next = stream
           break
         } catch (err) {
+          if (stream) { try { stream.getTracks().forEach((t) => t.stop()) } catch { /* noop */ } }
           lastErr = err
           if (err && (err.name === 'NotAllowedError' || err.name === 'SecurityError')) break
         }
@@ -740,6 +784,37 @@ function BroadcasterPage() {
       replaceVideoTrackOnCalls(proc.outTrack)
     }
   }, [swSettingsAreDefault, teardownSoftwareProcessor, buildSoftwareProcessor, replaceVideoTrackOnCalls])
+
+  // Build the cameraInfo payload sent to admin watchers so they can show the
+  // list of available cameras + which one is currently selected.
+  const buildCameraInfo = useCallback(() => ({
+    cameras: (camerasRef.current || []).map((c) => ({
+      deviceId: c.deviceId,
+      label: c.label,
+      facing: c.facing || null,
+      isUsb: !!c.isUsb,
+      isBuiltIn: !!c.isBuiltIn,
+    })),
+    currentCameraId: selectedCameraIdRef.current || null,
+  }), [])
+
+  // Push a fresh capabilities snapshot to every connected admin watcher.
+  // Used when the camera list changes (USB plug/unplug) or after a remote
+  // camera switch completes.
+  const broadcastCapabilities = useCallback(() => {
+    const snap = snapshotCameraCapabilities(
+      rawVideoTrackRef.current,
+      softwareSettingsRef.current,
+      buildCameraInfo(),
+    )
+    viewerConnsRef.current.forEach((conn) => {
+      if (conn?.open && conn.metadata?.kind === 'admin-watch') {
+        try { conn.send({ type: 'camera-capabilities', caps: snap }) } catch { /* noop */ }
+      }
+    })
+  }, [buildCameraInfo])
+
+  useEffect(() => { broadcastCapabilitiesRef.current = broadcastCapabilities }, [broadcastCapabilities])
 
   const sendPresence = useCallback(() => {
     adminSlotsRef.current.forEach(({ conn }) => {
@@ -967,7 +1042,7 @@ function BroadcasterPage() {
                 : null
               if (!constraints) return
               track.applyConstraints(constraints).then(() => {
-                const snap = snapshotCameraCapabilities(rawVideoTrackRef.current || track, softwareSettingsRef.current)
+                const snap = snapshotCameraCapabilities(rawVideoTrackRef.current || track, softwareSettingsRef.current, buildCameraInfo())
                 if (conn.open) {
                   try { conn.send({ type: 'camera-capabilities', caps: snap }) } catch { /* noop */ }
                 }
@@ -979,22 +1054,40 @@ function BroadcasterPage() {
             } else if (data.type === 'software-control' && data.pin === ADMIN_PIN) {
               if (data.settings && typeof data.settings === 'object') {
                 applySoftwareSettings(data.settings)
-                const snap = snapshotCameraCapabilities(rawVideoTrackRef.current, softwareSettingsRef.current)
+                const snap = snapshotCameraCapabilities(rawVideoTrackRef.current, softwareSettingsRef.current, buildCameraInfo())
                 if (conn.open) {
                   try { conn.send({ type: 'camera-capabilities', caps: snap }) } catch { /* noop */ }
                 }
               }
             } else if (data.type === 'camera-capabilities-request' && data.pin === ADMIN_PIN) {
-              const snap = snapshotCameraCapabilities(rawVideoTrackRef.current, softwareSettingsRef.current)
-              if (conn.open) {
-                try { conn.send({ type: 'camera-capabilities', caps: snap }) } catch { /* noop */ }
+              // Refresh device list opportunistically — picks up USB hot-plug.
+              refreshCameras().catch(() => {}).finally(() => {
+                const snap = snapshotCameraCapabilities(rawVideoTrackRef.current, softwareSettingsRef.current, buildCameraInfo())
+                if (conn.open) {
+                  try { conn.send({ type: 'camera-capabilities', caps: snap }) } catch { /* noop */ }
+                }
+              })
+            } else if (data.type === 'camera-select' && data.pin === ADMIN_PIN) {
+              const requested = String(data.cameraId || '')
+              if (!requested) return
+              // Validate against current camera list. Allow facing sentinels
+              // and known deviceIds; ignore anything else.
+              const list = camerasRef.current || []
+              const match = list.find((c) => c.deviceId === requested || c.candidateIds?.includes(requested))
+              if (!match) {
+                if (conn.open) {
+                  try { conn.send({ type: 'camera-control-error', message: 'Camera not found on broadcaster' }) } catch { /* noop */ }
+                }
+                return
               }
+              // setSelectedCameraId triggers the existing live-switch effect.
+              setSelectedCameraId(match.deviceId)
             }
           })
 
           conn.on('open', () => {
             if (isAdminWatch) {
-              const snap = snapshotCameraCapabilities(rawVideoTrackRef.current, softwareSettingsRef.current)
+              const snap = snapshotCameraCapabilities(rawVideoTrackRef.current, softwareSettingsRef.current, buildCameraInfo())
               try { conn.send({ type: 'camera-capabilities', caps: snap }) } catch { /* noop */ }
             }
             const call = peer.call(conn.peer, streamRef.current || localStream)
@@ -1254,14 +1347,24 @@ function BroadcasterPage() {
   useEffect(() => {
     if (statusRef.current === 'starting') return
     if (!selectedCameraId) return
+    const cameraEntry = resolveCameraEntry(selectedCameraId)
+    const matchesActive = (track) => {
+      if (!track || !cameraEntry) return false
+      const s = track.getSettings?.() || {}
+      // If the entry has a real deviceId (desktop / USB), compare those.
+      if (cameraEntry.candidateIds?.length) {
+        if (cameraEntry.deviceId === s.deviceId) return true
+        if (cameraEntry.candidateIds.includes(s.deviceId)) return true
+      }
+      // Mobile facing-only entry: match on the track's actual facing direction.
+      if (cameraEntry.facing) {
+        return readTrackFacing(track) === cameraEntry.facing
+      }
+      return false
+    }
     if (statusRef.current === 'live') {
-      const currentLive = streamRef.current?.getVideoTracks?.()[0]?.getSettings?.().deviceId
-      const cameraEntry = resolveCameraEntry(selectedCameraId)
-      if (
-        currentLive &&
-        cameraEntry &&
-        (cameraEntry.deviceId === currentLive || cameraEntry.candidateIds?.includes(currentLive))
-      ) return
+      const liveTrack = streamRef.current?.getVideoTracks?.()[0]
+      if (matchesActive(liveTrack)) return
       ;(async () => {
         const isMobile = IS_MOBILE_UA.test(navigator.userAgent || '')
         const oldRaw = rawVideoTrackRef.current
@@ -1303,13 +1406,8 @@ function BroadcasterPage() {
       })()
       return
     }
-    const current = previewStreamRef.current?.getVideoTracks?.()[0]?.getSettings?.().deviceId
-    const cameraEntry = resolveCameraEntry(selectedCameraId)
-    if (
-      current &&
-      cameraEntry &&
-      (cameraEntry.deviceId === current || cameraEntry.candidateIds?.includes(current))
-    ) return
+    const previewTrack = previewStreamRef.current?.getVideoTracks?.()[0]
+    if (matchesActive(previewTrack)) return
     void acquirePreview(selectedCameraId)
   }, [selectedCameraId, acquirePreview, replaceVideoTrackOnCalls, teardownSoftwareProcessor, resolveCameraEntry])
 
@@ -1652,6 +1750,14 @@ function ViewerPage() {
     if (!conn || !conn.open) return
     try {
       conn.send({ type: 'software-control', pin: ADMIN_PIN, settings })
+    } catch { /* noop */ }
+  }, [])
+
+  const sendCameraSelect = useCallback((cameraId) => {
+    const conn = connRef.current
+    if (!conn || !conn.open) return
+    try {
+      conn.send({ type: 'camera-select', pin: ADMIN_PIN, cameraId })
     } catch { /* noop */ }
   }, [])
 
@@ -2076,6 +2182,7 @@ function ViewerPage() {
                     caps={caps}
                     onChange={(constraints) => sendCameraControl(constraints)}
                     onSoftwareChange={(settings) => sendSoftwareControl(settings)}
+                    onSelectCamera={(cameraId) => sendCameraSelect(cameraId)}
                     onClose={() => setShowControls(false)}
                   />
                 </CameraControlsBoundary>
@@ -2338,12 +2445,14 @@ class CameraControlsBoundary extends Component {  constructor(props) {
   }
 }
 
-function CameraControls({ caps, onChange, onSoftwareChange, onClose }) {
+function CameraControls({ caps, onChange, onSoftwareChange, onSelectCamera, onClose }) {
   // Normalize: caps may be legacy hardware-only map, or { hardware, software }
   const hardware = caps && (caps.hardware !== undefined || caps.software !== undefined)
     ? caps.hardware
     : (caps || null)
   const software = caps && caps.software ? caps.software : null
+  const cameras = (caps && Array.isArray(caps.cameras)) ? caps.cameras : []
+  const currentCameraId = caps?.currentCameraId || null
   const hwEntries = hardware ? Object.entries(hardware) : []
   return (
     <div className="ctrlPanel">
@@ -2353,6 +2462,31 @@ function CameraControls({ caps, onChange, onSoftwareChange, onClose }) {
           <ChevronUp size={14} />
         </button>
       </div>
+      {onSelectCamera && cameras.length > 0 && (
+        <>
+          <div className="ctrlSection">Camera</div>
+          <div className="ctrlList">
+            <label className="ctrlRow">
+              <span className="ctrlLabel">Source</span>
+              <select
+                className="input"
+                value={currentCameraId || ''}
+                onChange={(e) => {
+                  const id = e.target.value
+                  if (id && id !== currentCameraId) onSelectCamera(id)
+                }}
+              >
+                {!currentCameraId && <option value="">(unknown)</option>}
+                {cameras.map((c) => (
+                  <option key={c.deviceId} value={c.deviceId}>
+                    {c.label}{c.isUsb ? ' · USB' : ''}{c.facing === 'environment' ? ' · back' : c.facing === 'user' ? ' · front' : ''}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+        </>
+      )}
       {hwEntries.length === 0 && (
         <p className="ctrlEmpty">No hardware controls reported by this camera. Use the software adjustments below.</p>
       )}
@@ -2580,6 +2714,13 @@ function AdminDashboard({ onSignOut }) {
     const conn = watchConnsRef.current.get(roomId)
     if (!conn || !conn.open) return
     try { conn.send({ type: 'software-control', pin: ADMIN_PIN, settings }) }
+    catch { /* noop */ }
+  }, [])
+
+  const sendCameraSelect = useCallback((roomId, cameraId) => {
+    const conn = watchConnsRef.current.get(roomId)
+    if (!conn || !conn.open) return
+    try { conn.send({ type: 'camera-select', pin: ADMIN_PIN, cameraId }) }
     catch { /* noop */ }
   }, [])
 
@@ -3244,6 +3385,7 @@ function AdminDashboard({ onSignOut }) {
                           caps={caps}
                           onChange={(constraints) => sendCameraControl(stream.roomId, constraints)}
                           onSoftwareChange={(settings) => sendSoftwareControl(stream.roomId, settings)}
+                          onSelectCamera={(cameraId) => sendCameraSelect(stream.roomId, cameraId)}
                           onClose={() => setOpenControls('')}
                         />
                       </CameraControlsBoundary>
