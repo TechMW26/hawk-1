@@ -58,6 +58,19 @@ const PRESENCE_TIMEOUT_MS = 15000
 const ADMIN_RETRY_MS = 2500
 const RESUME_STORAGE_KEY = 'hawk-resume-v1'
 
+// ICE server configuration for NAT traversal and relay fallback.
+// Google STUN is free and works globally; add TURN servers for production
+// environments behind symmetric NAT or restrictive firewalls.
+const ICE_SERVERS = {
+  iceServers: [
+    { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
+    // Add your own TURN server for production:
+    // { urls: 'turn:your-turn-server.com:3478', username: 'user', credential: 'pass' },
+  ],
+  iceCandidatePoolSize: 2,
+  iceTransportPolicy: 'all',
+}
+
 function readResumeSession() {
   try {
     const raw = localStorage.getItem(RESUME_STORAGE_KEY)
@@ -271,6 +284,124 @@ async function acquireStream(camera) {
   throw lastError || new Error('Unable to access camera')
 }
 
+// Adaptive bitrate controller: monitors RTCP stats (packet loss, RTT) and
+// dynamically adjusts video bitrate + resolution to maintain smooth playback
+// even on low-bandwidth or lossy networks.
+const ABR_TIERS = [
+  { maxBitrate: 300_000,  scaleDown: 0.5,  label: '240p'  },
+  { maxBitrate: 600_000,  scaleDown: 0.5,  label: '360p'  },
+  { maxBitrate: 1_000_000, scaleDown: 0.75, label: '480p' },
+  { maxBitrate: 1_800_000, scaleDown: 0.75, label: '720p' },
+  { maxBitrate: 3_000_000, scaleDown: 1.0,  label: '1080p' },
+]
+const ABR_CHECK_INTERVAL_MS = 2000
+const ABR_PACKET_LOSS_UP_THRESHOLD = 0.02   // 2% — switch up if below
+const ABR_PACKET_LOSS_DOWN_THRESHOLD = 0.08  // 8% — switch down if above
+const ABR_RTT_SPIKE_MS = 400                 // RTT above this triggers downgrade
+
+function createAdaptiveBitrateController(call, onTierChange) {
+  const pc = call?.peerConnection
+  if (!pc) return { start: () => {}, stop: () => {} }
+
+  let tierIndex = 2 // start at 480p (1 Mbps) — safe for most networks
+  let intervalId = null
+  let consecutiveGood = 0
+  let consecutiveBad = 0
+  const CONFIRMATION_COUNT = 3
+
+  const applyTier = (index) => {
+    const clamped = Math.max(0, Math.min(ABR_TIERS.length - 1, index))
+    tierIndex = clamped
+    const tier = ABR_TIERS[clamped]
+    try {
+      pc.getSenders().forEach((sender) => {
+        if (sender.track?.kind !== 'video') return
+        const params = sender.getParameters()
+        if (!params.encodings || params.encodings.length === 0) {
+          params.encodings = [{}]
+        }
+        const scaleX = tier.scaleDown
+        params.encodings.forEach((enc) => {
+          enc.maxBitrate = tier.maxBitrate
+          enc.maxFramerate = scaleX >= 1 ? 30 : scaleX >= 0.75 ? 24 : 15
+          enc.scaleResolutionDownBy = scaleX < 1 ? 1 / scaleX : undefined
+          enc.priority = 'high'
+          enc.networkPriority = 'high'
+        })
+        sender.setParameters(params).catch(() => {})
+      })
+    } catch { /* best-effort */ }
+    onTierChange?.(tier)
+  }
+
+  const checkStats = async () => {
+    try {
+      const stats = await pc.getStats()
+      let packetsLost = 0
+      let packetsReceived = 0
+      let rtt = 0
+      let rttSamples = 0
+
+      for (const report of stats.values()) {
+        if (report.type === 'inbound-rtp' && report.kind === 'video') {
+          packetsLost += report.packetsLost || 0
+          packetsReceived += report.packetsReceived || 0
+        }
+        if (report.type === 'candidate-pair' && report.state === 'succeeded' && report.currentRoundTripTime) {
+          rtt += report.currentRoundTripTime * 1000
+          rttSamples++
+        }
+        if (report.type === 'remote-inbound-rtp' && report.kind === 'video' && report.roundTripTime) {
+          rtt += report.roundTripTime * 1000
+          rttSamples++
+        }
+      }
+
+      const avgRtt = rttSamples > 0 ? rtt / rttSamples : 0
+      const totalPackets = packetsLost + packetsReceived
+      const lossRate = totalPackets > 0 ? packetsLost / totalPackets : 0
+
+      // Decide: should we move up or down?
+      if (lossRate > ABR_PACKET_LOSS_DOWN_THRESHOLD || avgRtt > ABR_RTT_SPIKE_MS) {
+        consecutiveGood = 0
+        consecutiveBad++
+        if (consecutiveBad >= CONFIRMATION_COUNT && tierIndex > 0) {
+          const newIdx = tierIndex - 1
+          applyTier(newIdx)
+          consecutiveBad = 0
+        }
+      } else if (lossRate < ABR_PACKET_LOSS_UP_THRESHOLD && avgRtt < ABR_RTT_SPIKE_MS * 0.5) {
+        consecutiveBad = 0
+        consecutiveGood++
+        if (consecutiveGood >= CONFIRMATION_COUNT && tierIndex < ABR_TIERS.length - 1) {
+          const newIdx = tierIndex + 1
+          applyTier(newIdx)
+          consecutiveGood = 0
+        }
+      } else {
+        consecutiveGood = Math.max(0, consecutiveGood - 1)
+        consecutiveBad = Math.max(0, consecutiveBad - 1)
+      }
+    } catch { /* stats query can fail; ignore */ }
+  }
+
+  // Apply initial safe tier immediately
+  applyTier(tierIndex)
+
+  return {
+    start: () => {
+      if (intervalId) return
+      intervalId = setInterval(checkStats, ABR_CHECK_INTERVAL_MS)
+    },
+    stop: () => {
+      if (intervalId) { clearInterval(intervalId); intervalId = null }
+    },
+    getCurrentTier: () => ABR_TIERS[tierIndex],
+  }
+}
+
+// Legacy static tuner kept for admin-watch-only calls that don't go through
+// the full ABR path. Still uses a conservative 1 Mbps default.
 function tuneSenderBitrate(call) {
   const pc = call?.peerConnection
   if (!pc) return
@@ -282,8 +413,8 @@ function tuneSenderBitrate(call) {
         params.encodings = [{}]
       }
       params.encodings.forEach((enc) => {
-        enc.maxBitrate = 2_500_000
-        enc.maxFramerate = 30
+        enc.maxBitrate = 1_000_000
+        enc.maxFramerate = 24
         enc.priority = 'high'
         enc.networkPriority = 'high'
       })
@@ -358,6 +489,7 @@ function BroadcasterPage() {
   const wakeLockRef = useRef(null)
   const statusRef = useRef('idle')
   const activeCallsRef = useRef(new Set())
+  const abrControllersRef = useRef(new Map()) // call -> { start, stop, getCurrentTier }
   const viewerConnsRef = useRef(new Set())
   // Map<slotId, { conn, heartbeat }>
   const adminSlotsRef = useRef(new Map())
@@ -1027,7 +1159,10 @@ function BroadcasterPage() {
       })
 
       const createPeer = (attempt = 0) => {
-        const peer = new Peer(desiredRoomId, { debug: 0 })
+        const peer = new Peer(desiredRoomId, {
+          debug: 0,
+          config: ICE_SERVERS,
+        })
         peerRef.current = peer
 
         peer.on('open', () => {
@@ -1120,12 +1255,65 @@ function BroadcasterPage() {
               sendPresence()
             }
 
-            const tune = () => tuneSenderBitrate(call)
+            // Adaptive bitrate: start safe (480p / ~1 Mbps) and auto-scale
+            // based on real network conditions. Admin-watch streams use the
+            // simpler static tuner since they're low-priority diagnostics.
+            let abr = null
+            if (!isAdminWatch) {
+              abr = createAdaptiveBitrateController(call, (tier) => {
+                // Optional: log tier changes for debugging
+                console.debug('[ABR] tier change →', tier.label, tier.maxBitrate / 1000, 'kbps')
+              })
+              abrControllersRef.current.set(call, abr)
+            }
+
             if (call.peerConnection) {
               const pc = call.peerConnection
+
+              // Inject transport-wide congestion control into the SDP offer
+              // so the browser can use bandwidth estimation feedback.
+              const origCreateOffer = pc.createOffer.bind(pc)
+              pc.createOffer = async (options) => {
+                const offer = await origCreateOffer(options)
+                let sdp = offer.sdp
+                // Ensure transport-cc is offered at media level for video
+                sdp = sdp.replace(
+                  /(a=rtcp-fb:\d+ .* (?:goog-remb|ccm fir|nack|nack pli|transport-cc).*\r?\n)/g,
+                  (match) => {
+                    if (!match.includes('transport-cc')) return match
+                    return match
+                  },
+                )
+                // Add transport-cc to each video m= section if missing
+                sdp = sdp.replace(
+                  /(m=video [\d]+ (?:UDP\/TLS\/RTP\/SAVPF|RTP\/SAVPF) [\d ]+)\r?\n/g,
+                  (match) => {
+                    if (!sdp.includes(`a=rtcp-fb:${match.split(' ')[1]} transport-cc`)) {
+                      const aLine = `a=rtcp-fb:${match.split(' ')[1]} transport-cc\r\n`
+                      // Insert after the c= line that follows m= line
+                      const cLineIdx = sdp.indexOf(match) + match.length
+                      const before = sdp.slice(0, cLineIdx)
+                      const after = sdp.slice(cLineIdx)
+                      // Find next a= line after c= line and insert before it
+                      const nextALine = after.match(/\r?\na=rtcp-fb:/)
+                      if (nextALine) {
+                        const insertIdx = after.indexOf(nextALine[0].trim())
+                        return before + after.slice(0, insertIdx) + aLine + after.slice(insertIdx)
+                      }
+                    }
+                    return match
+                  },
+                )
+                return { type: 'offer', sdp }
+              }
+
               pc.addEventListener('connectionstatechange', () => {
-                if (pc.connectionState === 'connected') tune()
+                if (pc.connectionState === 'connected') {
+                  if (abr) abr.start()
+                  else tuneSenderBitrate(call)
+                }
                 if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
+                  if (abr) abr.stop()
                   try { pc.restartIce?.() } catch { /* noop */ }
                 }
               })
@@ -1134,10 +1322,17 @@ function BroadcasterPage() {
                   try { pc.restartIce?.() } catch { /* noop */ }
                 }
               })
-              setTimeout(tune, 1500)
+              // Start ABR monitoring after a short delay to let the connection settle
+              if (abr) {
+                setTimeout(() => abr.start(), 2000)
+              } else {
+                setTimeout(() => tuneSenderBitrate(call), 1500)
+              }
             }
 
             const dropCall = () => {
+              const ctrl = abrControllersRef.current.get(call)
+              if (ctrl) { ctrl.stop(); abrControllersRef.current.delete(call) }
               activeCallsRef.current.delete(call)
               if (!isAdminWatch) {
                 setViewerCount(activeCallsRef.current.size)
@@ -1272,6 +1467,8 @@ function BroadcasterPage() {
     }
     if (previewRef.current) previewRef.current.srcObject = null
     activeCallsRef.current.clear()
+    abrControllersRef.current.forEach((ctrl) => ctrl.stop())
+    abrControllersRef.current.clear()
     viewerConnsRef.current.clear()
     presenceStateRef.current = { roomId: '', title: '', startedAt: 0 }
     clearResumeSession()
@@ -1337,6 +1534,7 @@ function BroadcasterPage() {
     // "starting" — especially painful on Android where reload is common.
     const onPageHide = () => {
       try {
+        abrControllersRef.current.forEach((ctrl) => ctrl.stop())
         viewerConnsRef.current.forEach((c) => {
           if (c.open) { try { c.send({ type: 'bye', reason: 'broadcaster-unload' }) } catch { /* noop */ } }
         })
@@ -1986,7 +2184,11 @@ function ViewerPage() {
         return
       }
       attemptRef.current += 1
-      const delayMs = Math.min(15000, 1000 * 2 ** Math.min(attemptRef.current - 1, 4))
+      const baseDelay = 1000 * 2 ** Math.min(attemptRef.current - 1, 4)
+      // Add jitter (±25%) to prevent reconnection storms when many viewers
+      // disconnect simultaneously (e.g. broadcaster restart).
+      const jitter = baseDelay * 0.25 * (Math.random() * 2 - 1)
+      const delayMs = Math.min(15000, baseDelay + jitter)
       setStatus('reconnecting')
       setError(message)
       reconnectTimerRef.current = window.setTimeout(connect, delayMs)
@@ -2006,7 +2208,7 @@ function ViewerPage() {
       setStatus(attemptRef.current === 0 ? 'connecting' : 'reconnecting')
       setError('')
 
-      const peer = new Peer({ debug: 0 })
+      const peer = new Peer({ debug: 0, config: ICE_SERVERS })
       peerRef.current = peer
 
       peer.on('open', () => {
@@ -2059,10 +2261,43 @@ function ViewerPage() {
           }
           const pc = call.peerConnection
           if (pc) {
+            // Stuck-stream sentinel: if video.currentTime hasn't changed
+            // for 8 seconds, the stream is frozen and we should reconnect.
+            let lastTime = 0
+            let stuckChecks = 0
+            const STUCK_CHECK_MS = 2000
+            const STUCK_THRESHOLD = 4 // 4 checks × 2s = 8s of no progress
+            const stuckTimer = setInterval(() => {
+              const el = videoRef.current
+              const curr = el?.currentTime || 0
+              if (curr === lastTime && el && !el.paused && el.readyState >= 2) {
+                stuckChecks++
+                if (stuckChecks >= STUCK_THRESHOLD) {
+                  clearInterval(stuckTimer)
+                  scheduleReconnect('Stream appears frozen. Reconnecting...')
+                }
+              } else {
+                stuckChecks = 0
+              }
+              lastTime = curr
+            }, STUCK_CHECK_MS)
+            // Clean up stuck timer when this call ends
+            const origOnClose = call._events?.close
+            const cleanupStuck = () => clearInterval(stuckTimer)
+            call.on('close', cleanupStuck)
+            call.on('error', cleanupStuck)
+
             pc.addEventListener('iceconnectionstatechange', () => {
               const s = pc.iceConnectionState
-              if (s === 'disconnected') {
+              if (s === 'disconnected' || s === 'failed') {
                 try { pc.restartIce?.() } catch { /* noop */ }
+              }
+            })
+            // Also monitor connectionstate for faster disconnect detection
+            pc.addEventListener('connectionstatechange', () => {
+              if (pc.connectionState === 'failed') {
+                clearInterval(stuckTimer)
+                scheduleReconnect('Connection lost. Reconnecting...')
               }
             })
           }
@@ -3139,7 +3374,7 @@ function AdminDashboard({ onSignOut }) {
         return
       }
       const slotId = ADMIN_PEER_IDS[index]
-      const peer = new Peer(slotId, { debug: 0 })
+      const peer = new Peer(slotId, { debug: 0, config: ICE_SERVERS })
       activePeer = peer
       peerRef.current = peer
       let opened = false
